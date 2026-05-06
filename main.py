@@ -110,7 +110,6 @@ class Bot:
         self.log = Logger()
         self.playwright = None
         self.browser = None
-        self.context = None
         self.is_running = False
         self.results: List[Account] = []
         self.total_accounts = 0
@@ -118,7 +117,7 @@ class Bot:
         self.manager: Optional[ConnectionManager] = None
     
     async def initialize(self):
-        """Initialize browser once"""
+        """Initialize browser once (without global context)"""
         try:
             self.log.info("Initializing Playwright...")
             self.playwright = await async_playwright().start()
@@ -135,12 +134,6 @@ class Bot:
                 ]
             )
             
-            self.context = await self.browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True
-            )
-            
             self.is_running = True
             self.log.info("Browser initialized successfully")
             return True
@@ -152,12 +145,6 @@ class Bot:
     async def cleanup(self):
         """Clean up resources"""
         self.is_running = False
-        
-        if self.context:
-            try:
-                await self.context.close()
-            except:
-                pass
         
         if self.browser:
             try:
@@ -174,55 +161,57 @@ class Bot:
         self.log.info("Cleanup completed")
     
     async def login_account(self, account: Account) -> Account:
-        """Login single account"""
+        """Login single account - EACH ACCOUNT GETS ITS OWN CONTEXT"""
+        context = None
         page = None
         
         try:
-            page = await self.context.new_page()
+            # NEW CONTEXT FOR EACH ACCOUNT - CRITICAL FIX
+            context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True
+            )
+            
+            page = await context.new_page()
             page.set_default_timeout(PRODUCTION_CONFIG["timeout"])
             
             await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
+            await asyncio.sleep(1)
+            
+            # LOGIN PROCESS
+            await page.wait_for_selector('input[name="userIdentifier"]', timeout=15000)
+            
+            await page.fill('input[name="userIdentifier"]', account.username)
             await asyncio.sleep(0.5)
             
-            # Check if already logged in
-            try:
-                balance_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=3000)
-                if balance_el:
-                    balance_text = await balance_el.inner_text()
-                    account.balance = balance_text
-                    account.balance_value = self._parse_balance(balance_text)
-                    account.status = AccountStatus.SUCCESS
-                    self.log.info(f"✅ {account.username} | {balance_text}")
-                    return account
-            except:
-                pass
+            await page.fill('input[type="password"]', account.password)
+            await asyncio.sleep(0.5)
             
-            # Login form
-            try:
-                await page.wait_for_selector('input[name="userIdentifier"]', timeout=10000)
-                await page.fill('input[name="userIdentifier"]', account.username)
-                await asyncio.sleep(0.3)
-                await page.fill('input[type="password"]', account.password)
-                await asyncio.sleep(0.3)
-                await page.click('[data-test-id="header-login-button"]')
-                
-                # Wait for balance
-                balance_el = await page.wait_for_selector(
-                    '[data-test-id="header-user-balance"]', 
-                    timeout=15000
-                )
-                
-                balance_text = await balance_el.inner_text()
-                account.balance = balance_text
-                account.balance_value = self._parse_balance(balance_text)
-                account.status = AccountStatus.SUCCESS
-                self.log.info(f"✅ {account.username} | {balance_text}")
-                
-            except PlaywrightTimeout:
-                account.status = AccountStatus.TIMEOUT
-                account.error = "Login timeout"
-                self.log.warning(f"⏰ {account.username} - Timeout")
+            await page.click('[data-test-id="header-login-button"]')
             
+            # WAIT FOR NAVIGATION AFTER LOGIN
+            await page.wait_for_load_state("networkidle")
+            
+            # GET BALANCE
+            balance_el = await page.wait_for_selector(
+                '[data-test-id="header-user-balance"]',
+                timeout=15000
+            )
+            
+            balance_text = await balance_el.inner_text()
+            account.balance = balance_text
+            account.balance_value = self._parse_balance(balance_text)
+            account.status = AccountStatus.SUCCESS
+            
+            self.log.info(f"✅ {account.username} | {balance_text}")
+            
+            return account
+            
+        except PlaywrightTimeout:
+            account.status = AccountStatus.TIMEOUT
+            account.error = "Login timeout"
+            self.log.warning(f"⏰ {account.username} - Timeout")
             return account
             
         except Exception as e:
@@ -232,11 +221,18 @@ class Bot:
             return account
             
         finally:
-            if page:
-                try:
+            # Clean up page and context for this account
+            try:
+                if page:
                     await page.close()
-                except:
-                    pass
+            except:
+                pass
+            
+            try:
+                if context:
+                    await context.close()
+            except:
+                pass
     
     def _parse_balance(self, text: str) -> float:
         try:
@@ -315,7 +311,7 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-# HTML UI (your provided UI)
+# HTML UI (your provided UI - unchanged)
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
