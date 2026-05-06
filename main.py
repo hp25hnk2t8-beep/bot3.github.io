@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import signal
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -22,9 +21,9 @@ PRODUCTION_CONFIG = {
     "log_level": os.getenv("LOG_LEVEL", "INFO"),
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
-    "headless": os.getenv("HEADLESS", "true").lower() == "true",
-    "timeout": int(os.getenv("TIMEOUT", 35000)),
-    "max_retries": int(os.getenv("MAX_RETRIES", 1)),
+    "headless": os.getenv("HEADLESS", "false").lower() == "true",  # false for debugging
+    "timeout": int(os.getenv("TIMEOUT", 45000)),
+    "max_retries": int(os.getenv("MAX_RETRIES", 2)),
     "results_dir": os.getenv("RESULTS_DIR", "results"),
     "log_file": os.getenv("LOG_FILE", "logs/bot.log"),
 }
@@ -117,7 +116,7 @@ class Bot:
         self.manager: Optional[ConnectionManager] = None
     
     async def initialize(self):
-        """Initialize browser once (without global context)"""
+        """Initialize browser once"""
         try:
             self.log.info("Initializing Playwright...")
             self.playwright = await async_playwright().start()
@@ -131,6 +130,8 @@ class Bot:
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
                 ]
             )
             
@@ -160,68 +161,193 @@ class Bot:
         
         self.log.info("Cleanup completed")
     
-    async def login_account(self, account: Account) -> Account:
-        """Login single account - EACH ACCOUNT GETS ITS OWN CONTEXT"""
+    async def login_account(self, account: Account, retry_count: int = 0) -> Account:
+        """Login single account with retry logic"""
         context = None
         page = None
         
         try:
-            # NEW CONTEXT FOR EACH ACCOUNT - CRITICAL FIX
+            # New context for each account
             context = await self.browser.new_context(
                 viewport={'width': 1280, 'height': 720},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True
+                ignore_https_errors=True,
+                locale='hy-AM'
             )
             
             page = await context.new_page()
             page.set_default_timeout(PRODUCTION_CONFIG["timeout"])
             
-            await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-            await asyncio.sleep(1)
+            # Go to login page
+            self.log.debug(f"Navigating to site for {account.username}")
+            await page.goto('https://www.adjarabet.am/hy', wait_until='networkidle')
+            await asyncio.sleep(2)
             
-            # LOGIN PROCESS
-            await page.wait_for_selector('input[name="userIdentifier"]', timeout=15000)
+            # Try different selectors for login form
+            login_selectors = [
+                'input[name="userIdentifier"]',
+                'input[placeholder*="Username"]',
+                'input[placeholder*="Email"]',
+                'input[type="text"][name*="user"]',
+                '#login-username',
+                '.login-input'
+            ]
             
-            await page.fill('input[name="userIdentifier"]', account.username)
+            password_selectors = [
+                'input[type="password"]',
+                'input[name="password"]',
+                '#login-password',
+                '.password-input'
+            ]
+            
+            login_button_selectors = [
+                '[data-test-id="header-login-button"]',
+                'button[type="submit"]',
+                '.login-button',
+                '#login-btn',
+                'button:has-text("Login")',
+                'button:has-text("Մուտք")'
+            ]
+            
+            # Find and fill username
+            username_field = None
+            for selector in login_selectors:
+                try:
+                    username_field = await page.wait_for_selector(selector, timeout=3000)
+                    if username_field:
+                        self.log.debug(f"Found username field with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not username_field:
+                # Take screenshot for debugging
+                screenshot_path = f"logs/debug_{account.username}.png"
+                await page.screenshot(path=screenshot_path)
+                raise Exception(f"Could not find username field. Screenshot saved to {screenshot_path}")
+            
+            await username_field.click()
+            await username_field.fill(account.username)
             await asyncio.sleep(0.5)
             
-            await page.fill('input[type="password"]', account.password)
+            # Find and fill password
+            password_field = None
+            for selector in password_selectors:
+                try:
+                    password_field = await page.wait_for_selector(selector, timeout=3000)
+                    if password_field:
+                        self.log.debug(f"Found password field with selector: {selector}")
+                        break
+                except:
+                    continue
+            
+            if not password_field:
+                raise Exception("Could not find password field")
+            
+            await password_field.click()
+            await password_field.fill(account.password)
             await asyncio.sleep(0.5)
             
-            await page.click('[data-test-id="header-login-button"]')
+            # Click login button
+            login_button = None
+            for selector in login_button_selectors:
+                try:
+                    login_button = await page.wait_for_selector(selector, timeout=3000)
+                    if login_button:
+                        self.log.debug(f"Found login button with selector: {selector}")
+                        break
+                except:
+                    continue
             
-            # WAIT FOR NAVIGATION AFTER LOGIN
-            await page.wait_for_load_state("networkidle")
+            if not login_button:
+                raise Exception("Could not find login button")
             
-            # GET BALANCE
-            balance_el = await page.wait_for_selector(
+            await login_button.click()
+            
+            # Wait for navigation and check for balance
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            await asyncio.sleep(2)
+            
+            # Check if login was successful by looking for balance element
+            balance_selectors = [
                 '[data-test-id="header-user-balance"]',
-                timeout=15000
-            )
+                '.user-balance',
+                '.balance',
+                '.header-balance',
+                '[class*="balance"]'
+            ]
             
-            balance_text = await balance_el.inner_text()
-            account.balance = balance_text
-            account.balance_value = self._parse_balance(balance_text)
-            account.status = AccountStatus.SUCCESS
+            balance_text = None
+            for selector in balance_selectors:
+                try:
+                    balance_el = await page.wait_for_selector(selector, timeout=5000)
+                    if balance_el:
+                        balance_text = await balance_el.inner_text()
+                        self.log.debug(f"Found balance with selector: {selector}")
+                        break
+                except:
+                    continue
             
-            self.log.info(f"✅ {account.username} | {balance_text}")
+            # Also check for error messages
+            error_selectors = [
+                '.error-message',
+                '.alert-danger',
+                '[class*="error"]',
+                'text=Invalid',
+                'text=Suspend'
+            ]
+            
+            for selector in error_selectors:
+                try:
+                    error_el = await page.query_selector(selector)
+                    if error_el:
+                        error_text = await error_el.inner_text()
+                        if error_text and len(error_text) > 0:
+                            raise Exception(f"Login error: {error_text[:100]}")
+                except:
+                    pass
+            
+            if balance_text:
+                account.balance = balance_text.strip()
+                account.balance_value = self._parse_balance(balance_text)
+                account.status = AccountStatus.SUCCESS
+                self.log.info(f"✅ {account.username} | Balance: {balance_text}")
+            else:
+                # Check if we're still on login page
+                current_url = page.url
+                if 'login' in current_url or 'signin' in current_url:
+                    raise Exception("Still on login page - authentication failed")
+                else:
+                    account.balance = "0"
+                    account.balance_value = 0.0
+                    account.status = AccountStatus.SUCCESS
+                    self.log.warning(f"⚠️ {account.username} | Logged in but balance not found")
             
             return account
             
-        except PlaywrightTimeout:
+        except PlaywrightTimeout as e:
+            if retry_count < PRODUCTION_CONFIG["max_retries"]:
+                self.log.warning(f"🔄 Retry {retry_count + 1}/{PRODUCTION_CONFIG['max_retries']} for {account.username}")
+                await asyncio.sleep(2)
+                return await self.login_account(account, retry_count + 1)
+            
             account.status = AccountStatus.TIMEOUT
-            account.error = "Login timeout"
-            self.log.warning(f"⏰ {account.username} - Timeout")
+            account.error = f"Timeout: {str(e)[:80]}"
+            self.log.warning(f"⏰ {account.username} - Timeout after {retry_count + 1} attempts")
             return account
             
         except Exception as e:
+            if retry_count < PRODUCTION_CONFIG["max_retries"]:
+                self.log.warning(f"🔄 Retry {retry_count + 1}/{PRODUCTION_CONFIG['max_retries']} for {account.username}: {str(e)[:50]}")
+                await asyncio.sleep(2)
+                return await self.login_account(account, retry_count + 1)
+            
             account.status = AccountStatus.FAILED
             account.error = str(e)[:100]
             self.log.error(f"❌ {account.username}: {str(e)[:80]}")
             return account
             
         finally:
-            # Clean up page and context for this account
             try:
                 if page:
                     await page.close()
@@ -236,11 +362,15 @@ class Bot:
     
     def _parse_balance(self, text: str) -> float:
         try:
-            match = re.search(r'([\d,]+\.?\d*)', text.replace(',', ''))
+            # Extract numbers with commas and dots
+            clean_text = re.sub(r'[^\d,.]', '', text)
+            # Handle Armenian currency format
+            clean_text = clean_text.replace(',', '')
+            match = re.search(r'(\d+(?:\.\d+)?)', clean_text)
             if match:
                 return float(match.group(1))
-        except:
-            pass
+        except Exception as e:
+            self.log.debug(f"Balance parsing error: {e}")
         return 0.0
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager):
@@ -255,26 +385,30 @@ class Bot:
         
         for i, account in enumerate(accounts, 1):
             if not self.is_running:
+                self.log.info("Bot stopped by user")
                 break
             
+            self.log.info(f"Processing {i}/{self.total_accounts}: {account.username}")
             result = await self.login_account(account)
             self.results.append(result)
             self.processed = i
             
-            # Save results
+            # Save results after each account
             await self._save_results()
             
             # Send real-time updates
             await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
             await manager.broadcast(f"PROGRESS:{i}/{self.total_accounts}")
             
-            await asyncio.sleep(0.5)
+            # Small delay between accounts
+            await asyncio.sleep(1)
         
         # Send summary
         successful = sum(1 for r in self.results if r.status == AccountStatus.SUCCESS)
         rate = (successful / self.total_accounts * 100) if self.total_accounts > 0 else 0
         
-        await manager.broadcast(f"SUMMARY:{successful}/{self.total_accounts}:{rate:.1f}")
+        summary_msg = f"SUMMARY:✅ {successful} success, ❌ {self.total_accounts - successful} failed, 📊 {rate:.1f}% success rate"
+        await manager.broadcast(summary_msg)
         await manager.broadcast("STATUS:stopped")
         
         duration = (datetime.now() - start_time).total_seconds()
@@ -311,571 +445,283 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-# HTML UI (your provided UI - unchanged)
+# Simple HTML UI (minimal version for testing)
 HTML_UI = '''<!DOCTYPE html>
-<html lang="hy">
+<html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Adjarabet Bot | Ultimate Pro v7.0</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <title>Adjarabet Bot</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            background: linear-gradient(135deg, #0a0e1a 0%, #0f1420 50%, #0a0e1a 100%);
-            color: #e4e6eb;
-            font-family: 'Inter', sans-serif;
-            min-height: 100vh;
-            padding: 20px;
-            position: relative;
-        }
-        body::before {
-            content: '';
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: radial-gradient(circle at 20% 50%, rgba(88, 166, 255, 0.05) 0%, transparent 50%),
-                        radial-gradient(circle at 80% 80%, rgba(63, 185, 80, 0.03) 0%, transparent 50%);
-            pointer-events: none;
-            z-index: 0;
-        }
-        .app-container { max-width: 1800px; margin: 0 auto; position: relative; z-index: 1; }
-        .header {
-            background: linear-gradient(135deg, rgba(22, 27, 34, 0.98) 0%, rgba(13, 17, 23, 0.98) 100%);
-            backdrop-filter: blur(20px);
-            border-radius: 24px;
-            padding: 20px 32px;
-            margin-bottom: 24px;
-            border: 1px solid rgba(88, 166, 255, 0.2);
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
-        }
-        .header-content { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 20px; }
-        .title-section { display: flex; align-items: center; gap: 18px; }
-        .logo-icon {
-            width: 55px; height: 55px;
-            background: linear-gradient(135deg, #58a6ff, #1f6feb);
-            border-radius: 18px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 30px;
-            animation: pulseGlow 2s infinite;
-        }
-        @keyframes pulseGlow {
-            0%, 100% { box-shadow: 0 0 0 0 rgba(88, 166, 255, 0.5); }
-            50% { box-shadow: 0 0 0 15px rgba(88, 166, 255, 0); }
-        }
-        h1 {
-            font-size: 32px;
-            font-weight: 800;
-            background: linear-gradient(135deg, #58a6ff, #79c0ff, #3fb950);
-            -webkit-background-clip: text;
-            background-clip: text;
-            color: transparent;
-            letter-spacing: -0.5px;
-        }
-        .version { font-size: 12px; color: #8b949e; background: rgba(33, 38, 45, 0.8); padding: 4px 12px; border-radius: 20px; margin-left: 12px; }
-        .status-card { display: flex; align-items: center; gap: 20px; background: rgba(33, 38, 45, 0.8); padding: 10px 24px; border-radius: 60px; backdrop-filter: blur(10px); border: 1px solid rgba(88, 166, 255, 0.2); }
-        .status-dot { width: 14px; height: 14px; border-radius: 50%; transition: all 0.3s ease; }
-        .status-dot.running { background: #3fb950; box-shadow: 0 0 15px #3fb950; animation: pulse 1.5s infinite; }
-        .status-dot.stopped { background: #f85149; }
-        @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.6; transform: scale(1.15); } }
-        .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; margin-bottom: 24px; }
-        .stat-card {
-            background: linear-gradient(135deg, rgba(22, 27, 34, 0.95) 0%, rgba(13, 17, 23, 0.95) 100%);
-            backdrop-filter: blur(10px);
-            border-radius: 20px;
-            padding: 22px;
-            border: 1px solid rgba(48, 54, 61, 0.5);
-            transition: all 0.3s ease;
-            cursor: pointer;
-            position: relative;
-            overflow: hidden;
-        }
-        .stat-card:hover { transform: translateY(-5px); border-color: #58a6ff; box-shadow: 0 10px 30px rgba(88, 166, 255, 0.2); }
-        .stat-icon { font-size: 36px; margin-bottom: 12px; }
-        .stat-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-        .stat-number { font-size: 42px; font-weight: 800; background: linear-gradient(135deg, #fff, #58a6ff); -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .main-grid { display: grid; grid-template-columns: 1fr 1.2fr; gap: 24px; margin-bottom: 24px; }
-        .card {
-            background: linear-gradient(135deg, rgba(22, 27, 34, 0.97) 0%, rgba(13, 17, 23, 0.97) 100%);
-            backdrop-filter: blur(10px);
-            border-radius: 24px;
-            border: 1px solid rgba(48, 54, 61, 0.5);
-            overflow: hidden;
-        }
-        .card-header { padding: 20px 28px; background: rgba(33, 38, 45, 0.6); border-bottom: 1px solid rgba(48, 54, 61, 0.5); display: flex; align-items: center; gap: 12px; }
-        .card-header i { font-size: 26px; color: #58a6ff; }
-        .card-header h3 { font-size: 18px; font-weight: 600; color: #e4e6eb; }
-        .card-body { padding: 24px; }
-        .search-accounts { margin-bottom: 16px; position: relative; }
-        .search-accounts input { width: 100%; padding: 12px 16px 12px 40px; background: #0d1117; border: 1px solid #30363d; border-radius: 12px; color: #e4e6eb; font-size: 14px; transition: all 0.3s ease; }
-        .search-accounts input:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1); }
-        .search-accounts i { position: absolute; left: 14px; top: 50%; transform: translateY(-50%); color: #8b949e; }
-        .accounts-count { font-size: 12px; color: #8b949e; margin-top: 8px; }
-        .accounts-input { width: 100%; min-height: 280px; background: #0d1117; color: #e4e6eb; border: 2px solid #30363d; border-radius: 16px; padding: 16px; font-family: 'Courier New', monospace; font-size: 13px; resize: vertical; transition: all 0.3s ease; }
-        .accounts-input:focus { outline: none; border-color: #58a6ff; box-shadow: 0 0 0 4px rgba(88, 166, 255, 0.1); }
-        .button-group { display: flex; gap: 12px; margin-top: 20px; flex-wrap: wrap; }
-        .btn { padding: 12px 28px; border: none; border-radius: 14px; font-weight: 600; font-size: 14px; cursor: pointer; transition: all 0.3s ease; display: inline-flex; align-items: center; gap: 10px; font-family: 'Inter', sans-serif; }
-        .btn-primary { background: linear-gradient(135deg, #238636, #2ea043); color: white; }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(35, 134, 54, 0.4); }
-        .btn-danger { background: linear-gradient(135deg, #da3633, #f85149); color: white; }
-        .btn-danger:hover { transform: translateY(-2px); box-shadow: 0 5px 20px rgba(218, 54, 51, 0.4); }
-        .btn-secondary { background: linear-gradient(135deg, #6e7681, #8b949e); color: white; }
-        .btn-secondary:hover { transform: translateY(-2px); }
-        .terminal-container { background: #010409; border-radius: 16px; height: 450px; overflow: hidden; display: flex; flex-direction: column; }
-        .terminal-header { background: #161b22; padding: 14px 20px; border-bottom: 1px solid #30363d; display: flex; justify-content: space-between; align-items: center; }
-        .terminal-title { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 500; }
-        .terminal-btn { background: none; border: none; color: #8b949e; cursor: pointer; padding: 6px 12px; border-radius: 8px; transition: all 0.2s; }
-        .terminal-btn:hover { background: #21262d; color: #58a6ff; }
-        .terminal { flex: 1; overflow-y: auto; padding: 16px; font-family: 'Courier New', monospace; font-size: 12px; }
-        .terminal-line { padding: 4px 0; border-bottom: 1px solid rgba(22, 27, 34, 0.3); white-space: pre-wrap; word-break: break-all; animation: fadeIn 0.3s ease; }
-        @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-        .search-box { margin-bottom: 16px; padding: 0 16px; display: flex; gap: 12px; flex-wrap: wrap; }
-        .search-input { flex: 1; padding: 10px 16px; background: #0d1117; border: 1px solid #30363d; border-radius: 12px; color: #e4e6eb; font-size: 14px; }
-        .filter-buttons { display: flex; gap: 8px; }
-        .filter-btn { padding: 8px 16px; background: #21262d; border: 1px solid #30363d; border-radius: 10px; color: #8b949e; cursor: pointer; transition: all 0.2s; font-size: 12px; }
-        .filter-btn.active { background: #58a6ff; color: white; border-color: #58a6ff; }
-        .table-container { max-height: 450px; overflow-y: auto; border-radius: 16px; }
-        .results-table table { width: 100%; border-collapse: collapse; }
-        .results-table th { background: #161b22; padding: 14px; text-align: left; font-size: 13px; font-weight: 600; color: #8b949e; position: sticky; top: 0; z-index: 10; cursor: pointer; }
-        .results-table th:hover { background: #21262d; color: #58a6ff; }
-        .results-table td { padding: 12px 14px; border-bottom: 1px solid #21262d; font-size: 13px; }
-        .results-table tr { transition: all 0.2s ease; animation: slideIn 0.2s ease; }
-        @keyframes slideIn { from { opacity: 0; transform: translateX(-10px); } to { opacity: 1; transform: translateX(0); } }
-        .results-table tr:hover { background: rgba(33, 38, 45, 0.6); }
-        .copy-btn { background: none; border: none; color: #58a6ff; cursor: pointer; padding: 4px 8px; border-radius: 6px; transition: all 0.2s; }
-        .copy-btn:hover { background: rgba(88, 166, 255, 0.2); }
-        .copy-btn.copied { color: #3fb950; }
-        .balance-positive { color: #3fb950; font-weight: bold; }
-        .balance-zero { color: #f85149; }
-        .sort-indicator { margin-left: 5px; font-size: 10px; }
-        .toast { position: fixed; bottom: 30px; right: 30px; background: linear-gradient(135deg, #21262d, #161b22); border-left: 4px solid #58a6ff; padding: 14px 24px; border-radius: 12px; animation: slideInRight 0.3s ease; z-index: 1000; }
-        @keyframes slideInRight { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
-        .progress-bar-container { margin-top: 10px; width: 100%; height: 6px; background: #21262d; border-radius: 3px; overflow: hidden; }
-        .progress-bar { height: 100%; background: linear-gradient(90deg, #238636, #3fb950); width: 0%; transition: width 0.3s ease; }
-        @media (max-width: 1024px) { .main-grid { grid-template-columns: 1fr; } .stats-grid { grid-template-columns: repeat(2, 1fr); } }
+        body { font-family: Arial, sans-serif; margin: 20px; background: #1a1a2e; color: #eee; }
+        .container { max-width: 1200px; margin: 0 auto; }
+        .card { background: #16213e; border-radius: 10px; padding: 20px; margin-bottom: 20px; }
+        textarea { width: 100%; min-height: 200px; background: #0f0f1a; color: #fff; border: 1px solid #2c3e50; padding: 10px; font-family: monospace; }
+        button { background: #e94560; color: white; border: none; padding: 10px 20px; margin: 5px; cursor: pointer; border-radius: 5px; }
+        button:hover { background: #ff6b6b; }
+        .status { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+        .status.running { background: #00ff00; box-shadow: 0 0 5px #00ff00; }
+        .status.stopped { background: #ff0000; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #2c3e50; }
+        th { background: #0f3460; cursor: pointer; }
+        tr:hover { background: #1a1a2e; }
+        .success { color: #00ff00; }
+        .error { color: #ff4444; }
+        .timeout { color: #ffaa00; }
+        .progress-bar { width: 100%; height: 20px; background: #2c3e50; border-radius: 10px; overflow: hidden; margin: 10px 0; }
+        .progress-fill { height: 100%; background: #00ff00; transition: width 0.3s; }
+        .terminal { background: #0f0f1a; padding: 10px; border-radius: 5px; height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; }
+        .stats { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat { flex: 1; background: #0f3460; padding: 15px; border-radius: 10px; text-align: center; }
+        .stat-value { font-size: 32px; font-weight: bold; }
     </style>
 </head>
 <body>
-    <div class="app-container">
-        <div class="header">
-            <div class="header-content">
-                <div class="title-section">
-                    <div class="logo-icon"><i class="fas fa-robot"></i></div>
-                    <div>
-                        <h1>Adjarabet Bot <span class="version">Pro v7.0</span></h1>
-                        <p style="font-size: 13px; color: #8b949e; margin-top: 5px;">Real-Time • Live Updates • Professional</p>
-                    </div>
-                </div>
-                <div class="status-card">
-                    <div class="status-indicator">
-                        <div class="status-dot stopped" id="statusDot"></div>
-                        <span id="statusText">Stopped</span>
-                    </div>
-                    <div class="status-indicator">
-                        <i class="fas fa-clock" style="color: #8b949e;"></i>
-                        <span id="uptime">00:00:00</span>
-                    </div>
-                </div>
+    <div class="container">
+        <h1>🤖 Adjarabet Bot v13.0</h1>
+        
+        <div class="stats">
+            <div class="stat">
+                <div>Total Accounts</div>
+                <div class="stat-value" id="totalCount">0</div>
+            </div>
+            <div class="stat">
+                <div>Success</div>
+                <div class="stat-value" id="successCount" style="color: #00ff00;">0</div>
+            </div>
+            <div class="stat">
+                <div>Failed</div>
+                <div class="stat-value" id="failedCount" style="color: #ff4444;">0</div>
+            </div>
+            <div class="stat">
+                <div>Timeout</div>
+                <div class="stat-value" id="timeoutCount" style="color: #ffaa00;">0</div>
             </div>
         </div>
-
-        <div class="stats-grid">
-            <div class="stat-card" onclick="setFilter('all')">
-                <div class="stat-icon">📊</div>
-                <div class="stat-label">Total</div>
-                <div class="stat-number" id="totalCount">0</div>
-            </div>
-            <div class="stat-card" onclick="setFilter('success')">
-                <div class="stat-icon">✅</div>
-                <div class="stat-label">Success</div>
-                <div class="stat-number" id="successCount">0</div>
-            </div>
-            <div class="stat-card" onclick="setFilter('failed')">
-                <div class="stat-icon">❌</div>
-                <div class="stat-label">Failed</div>
-                <div class="stat-number" id="failedCount">0</div>
-            </div>
-            <div class="stat-card" onclick="setFilter('timeout')">
-                <div class="stat-icon">⏰</div>
-                <div class="stat-label">Timeout</div>
-                <div class="stat-number" id="timeoutCount">0</div>
+        
+        <div class="card">
+            <h3>Account Management</h3>
+            <textarea id="accounts" placeholder="username1:password1&#10;username2:password2"></textarea>
+            <div>
+                <button onclick="startBot()">▶ Start Bot</button>
+                <button onclick="stopBot()">⏹ Stop</button>
+                <button onclick="clearAccounts()">🗑 Clear</button>
+                <button onclick="loadSample()">📝 Sample</button>
+                <button onclick="clearResults()">🗑 Clear Results</button>
             </div>
         </div>
-
-        <div class="main-grid">
-            <div class="card">
-                <div class="card-header"><i class="fas fa-users"></i><h3>Account Management</h3></div>
-                <div class="card-body">
-                    <div class="search-accounts">
-                        <i class="fas fa-search"></i>
-                        <input type="text" id="accountsSearchInput" placeholder="🔍 Search in accounts...">
-                    </div>
-                    <textarea id="accounts" class="accounts-input" placeholder="username1:password1&#10;username2:password2"></textarea>
-                    <div class="accounts-count" id="accountsCount">0 accounts loaded</div>
-                    <div class="button-group">
-                        <button class="btn btn-primary" onclick="startBot()"><i class="fas fa-play"></i> Start Bot</button>
-                        <button class="btn btn-danger" onclick="stopBot()"><i class="fas fa-stop"></i> Stop</button>
-                        <button class="btn btn-secondary" onclick="clearAllAccounts()"><i class="fas fa-trash-alt"></i> Clear All</button>
-                        <button class="btn btn-secondary" onclick="loadSample()"><i class="fas fa-file-alt"></i> Sample</button>
-                    </div>
-                </div>
+        
+        <div class="card">
+            <h3>Progress</h3>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressBar"></div>
             </div>
-
-            <div class="card">
-                <div class="card-header"><i class="fas fa-terminal"></i><h3>Live Console</h3></div>
-                <div class="card-body" style="padding: 0;">
-                    <div class="terminal-container">
-                        <div class="terminal-header">
-                            <div class="terminal-title"><i class="fas fa-code"></i><span>Bot Logs</span></div>
-                            <div class="terminal-actions">
-                                <button class="terminal-btn" onclick="clearTerminal()" title="Clear"><i class="fas fa-eraser"></i></button>
-                                <button class="terminal-btn" onclick="exportLogs()" title="Export"><i class="fas fa-download"></i></button>
-                            </div>
-                        </div>
-                        <div id="terminal" class="terminal">
-                            <div class="terminal-line">🎮 Welcome to Adjarabet Bot Pro v7.0</div>
-                            <div class="terminal-line">💡 Results appear in REAL-TIME as they are checked</div>
-                        </div>
-                    </div>
-                </div>
+            <div id="progressText">Waiting to start...</div>
+        </div>
+        
+        <div class="card">
+            <h3>Live Console</h3>
+            <div class="terminal" id="terminal">
+                <div>🎮 Bot initialized - Waiting for commands...</div>
             </div>
         </div>
-
-        <div class="card results-table">
-            <div class="card-header">
-                <i class="fas fa-chart-line"></i><h3>Results Dashboard</h3>
-                <div style="flex: 1; margin: 0 20px;"><div class="progress-bar-container"><div class="progress-bar" id="progressBar"></div></div></div>
-                <button class="terminal-btn" onclick="refreshResults()" style="margin-left: auto;"><i class="fas fa-sync-alt"></i> Refresh</button>
-            </div>
-            <div class="card-body" style="padding: 0;">
-                <div class="search-box">
-                    <input type="text" id="searchInput" class="search-input" placeholder="🔍 Search by username or password...">
-                    <div class="filter-buttons">
-                        <button class="filter-btn active" data-filter="all" onclick="setFilter('all')">All</button>
-                        <button class="filter-btn" data-filter="success" onclick="setFilter('success')">✅ Success</button>
-                        <button class="filter-btn" data-filter="failed" onclick="setFilter('failed')">❌ Failed</button>
-                        <button class="filter-btn" data-filter="timeout" onclick="setFilter('timeout')">⏰ Timeout</button>
-                    </div>
-                </div>
-                <div class="table-container">
-                    <table class="results-table">
-                        <thead>
-                            <tr>
-                                <th onclick="sortBy('status')">Status <span class="sort-indicator" id="sort-status"></span></th>
-                                <th onclick="sortBy('username')">Username <span class="sort-indicator" id="sort-username"></span></th>
-                                <th onclick="sortBy('password')">Password <span class="sort-indicator" id="sort-password"></span></th>
-                                <th onclick="sortBy('balance')">Balance <span class="sort-indicator" id="sort-balance">▼</span></th>
-                                <th onclick="sortBy('error')">Error <span class="sort-indicator" id="sort-error"></span></th>
-                            </tr>
-                        </thead>
-                        <tbody id="resultsBody">
-                            <tr><td colspan="5" style="text-align: center; color: #8b949e; padding: 40px;">Waiting for results...</td></tr>
-                        </tbody>
-                    </table>
-                </div>
+        
+        <div class="card">
+            <h3>Results</h3>
+            <div style="overflow-x: auto;">
+                <table id="resultsTable">
+                    <thead>
+                        <tr>
+                            <th>Status</th>
+                            <th>Username</th>
+                            <th>Password</th>
+                            <th>Balance</th>
+                            <th>Error</th>
+                        </tr>
+                    </thead>
+                    <tbody id="resultsBody">
+                        <tr><td colspan="5">No results yet...</td></tr>
+                    </tbody>
+                </table>
             </div>
         </div>
     </div>
-
+    
     <script>
         let ws = null;
         let allResults = [];
-        let originalAccounts = '';
-        let currentFilter = 'all';
-        let currentSort = { field: 'balance', direction: 'desc' };
-        let botStartTime = null;
-        let uptimeInterval = null;
-        let currentProgress = { processed: 0, total: 0 };
-        let loggedUsernames = new Set();
-
+        
         function connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
             
-            ws.onopen = () => { addTerminalLine('🟢 Connected - Real-time updates active', 'success'); loadResults(); loggedUsernames.clear(); };
+            ws.onopen = () => {
+                addLog('🟢 Connected to server');
+                loadResults();
+            };
+            
             ws.onmessage = (event) => {
                 const data = event.data;
                 if (data.startsWith('RESULT:')) {
-                    try {
-                        const result = JSON.parse(data.substring(7));
-                        addOrUpdateResult(result);
-                        if (!loggedUsernames.has(result.username)) {
-                            loggedUsernames.add(result.username);
-                            addTerminalLine(`${result.status} ${result.username} | ${result.balance || '0'}`, 
-                                result.status === '✅' ? 'success' : result.status === '❌' ? 'error' : 'warning');
-                        }
-                    } catch(e) {}
+                    const result = JSON.parse(data.substring(7));
+                    addOrUpdateResult(result);
+                    addLog(`${result.status} ${result.username} | Balance: ${result.balance || '0'}`);
                 } else if (data.startsWith('PROGRESS:')) {
                     const parts = data.substring(9).split('/');
-                    currentProgress = { processed: parseInt(parts[0]), total: parseInt(parts[1]) };
-                    updateProgressBar();
+                    const processed = parseInt(parts[0]);
+                    const total = parseInt(parts[1]);
+                    const percent = (processed / total * 100);
+                    document.getElementById('progressBar').style.width = percent + '%';
+                    document.getElementById('progressText').innerHTML = `Processing: ${processed}/${total} (${percent.toFixed(1)}%)`;
                 } else if (data.startsWith('SUMMARY:')) {
-                    const parts = data.substring(8).split(':');
-                    addTerminalLine(`📊 Summary: ${parts[0]} (${parts[2]}%)`, 'info');
+                    addLog('📊 ' + data.substring(8));
                 } else if (data.startsWith('STATUS:')) {
                     const status = data.substring(7);
-                    updateBotStatus(status === 'started');
-                    if (status === 'started') loggedUsernames.clear();
+                    addLog(`Bot status: ${status}`);
                 } else {
-                    addTerminalLine(data.replace(/^(INFO|ERROR|WARNING):\s*/, ''), 
-                        data.includes('ERROR') ? 'error' : data.includes('WARNING') ? 'warning' : 'info');
+                    addLog(data);
                 }
             };
-            ws.onclose = () => { addTerminalLine('🔴 Disconnected - Reconnecting...', 'warning'); setTimeout(connectWebSocket, 3000); };
+            
+            ws.onclose = () => {
+                addLog('🔴 Disconnected - Reconnecting...');
+                setTimeout(connectWebSocket, 3000);
+            };
         }
-
-        function updateProgressBar() {
-            const progressBar = document.getElementById('progressBar');
-            if (currentProgress.total > 0) progressBar.style.width = (currentProgress.processed / currentProgress.total * 100) + '%';
-            else progressBar.style.width = '0%';
-        }
-
+        
         function addOrUpdateResult(newResult) {
-            const existingIndex = allResults.findIndex(r => r.username === newResult.username);
-            if (existingIndex >= 0) allResults[existingIndex] = newResult;
-            else allResults.push(newResult);
+            const index = allResults.findIndex(r => r.username === newResult.username);
+            if (index >= 0) {
+                allResults[index] = newResult;
+            } else {
+                allResults.push(newResult);
+            }
             renderResults();
             updateStats();
         }
-
-        function parseBalance(balanceStr) {
-            if (!balanceStr) return 0;
-            const match = balanceStr.match(/[\\d,.]+/);
-            return match ? parseFloat(match[0].replace(/,/g, '')) : 0;
-        }
-
-        function sortResults(results) {
-            return [...results].sort((a, b) => {
-                let aVal, bVal;
-                switch(currentSort.field) {
-                    case 'balance': aVal = parseBalance(a.balance); bVal = parseBalance(b.balance); break;
-                    case 'username': aVal = (a.username || '').toLowerCase(); bVal = (b.username || '').toLowerCase(); break;
-                    case 'password': aVal = (a.password || '').toLowerCase(); bVal = (b.password || '').toLowerCase(); break;
-                    case 'status': aVal = a.status || ''; bVal = b.status || ''; break;
-                    case 'error': aVal = (a.error || '').toLowerCase(); bVal = (b.error || '').toLowerCase(); break;
-                    default: return 0;
-                }
-                return currentSort.direction === 'asc' ? (aVal > bVal ? 1 : -1) : (aVal < bVal ? 1 : -1);
-            });
-        }
-
-        function filterResults(results) {
-            if (currentFilter === 'all') return results;
-            const statusMap = { 'success': '✅', 'failed': '❌', 'timeout': '⏰' };
-            return results.filter(r => r.status === statusMap[currentFilter]);
-        }
-
-        function renderResults() {
-            const searchTerm = document.getElementById('searchInput').value.toLowerCase();
-            let filtered = filterResults(allResults);
-            filtered = filtered.filter(r => (r.username || '').toLowerCase().includes(searchTerm) || (r.password || '').toLowerCase().includes(searchTerm));
-            const sorted = sortResults(filtered);
-            const tbody = document.getElementById('resultsBody');
-            if (sorted.length === 0) tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #8b949e; padding: 40px;">No results found</td></tr>';
-            else {
-                tbody.innerHTML = sorted.map(acc => {
-                    const balanceValue = parseBalance(acc.balance);
-                    return `<tr>
-                        <td style="font-size: 20px;">${acc.status || '-'}</td>
-                        <td><div style="display: flex; align-items: center; justify-content: space-between;"><strong style="color: #58a6ff;">${escapeHtml(acc.username || '')}</strong><button class="copy-btn" onclick="copyText('${escapeHtml(acc.username || '')}', this)"><i class="fas fa-copy"></i></button></div></td>
-                        <td><div style="display: flex; align-items: center; justify-content: space-between;"><span style="font-family: monospace;">${escapeHtml(acc.password || '')}</span><button class="copy-btn" onclick="copyText('${escapeHtml(acc.password || '')}', this)"><i class="fas fa-copy"></i></button></div></td>
-                        <td class="${balanceValue > 0 ? 'balance-positive' : 'balance-zero'}">${acc.balance || '0'}</td>
-                        <td style="color: #8b949e; font-size: 12px;">${acc.error || '-'}</td>
-                    </tr>`;
-                }).join('');
-            }
-            updateSortIndicators();
-        }
-
-        function updateStats() {
-            document.getElementById('totalCount').textContent = allResults.length;
-            document.getElementById('successCount').textContent = allResults.filter(r => r.status === '✅').length;
-            document.getElementById('failedCount').textContent = allResults.filter(r => r.status === '❌').length;
-            document.getElementById('timeoutCount').textContent = allResults.filter(r => r.status === '⏰').length;
-        }
-
-        function updateSortIndicators() {
-            ['status', 'username', 'password', 'balance', 'error'].forEach(field => {
-                const el = document.getElementById(`sort-${field}`);
-                if (el) el.innerHTML = currentSort.field === field ? (currentSort.direction === 'asc' ? '▲' : '▼') : '';
-            });
-        }
-
-        function sortBy(field) {
-            if (currentSort.field === field) currentSort.direction = currentSort.direction === 'asc' ? 'desc' : 'asc';
-            else { currentSort.field = field; currentSort.direction = field === 'balance' ? 'desc' : 'asc'; }
-            renderResults();
-        }
-
-        function setFilter(filter) {
-            currentFilter = filter;
-            document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.filter === filter));
-            renderResults();
-        }
-
-        function escapeHtml(str) { if (!str) return ''; return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[m]); }
         
-        function copyText(text, btn) {
-            navigator.clipboard.writeText(text).then(() => {
-                const icon = btn.querySelector('i');
-                icon.className = 'fas fa-check';
-                btn.classList.add('copied');
-                setTimeout(() => { icon.className = 'fas fa-copy'; btn.classList.remove('copied'); }, 1500);
-                showToast('Copied to clipboard');
-            });
-        }
-
-        function addTerminalLine(text, type = 'info') {
-            const term = document.getElementById('terminal');
-            const div = document.createElement('div');
-            div.className = 'terminal-line';
-            div.innerHTML = `<span style="color: #6e7681;">[${new Date().toLocaleTimeString()}]</span> ${text}`;
-            term.appendChild(div);
-            div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-            while (term.children.length > 500) term.removeChild(term.firstChild);
-        }
-
-        function showToast(message) {
-            const toast = document.createElement('div');
-            toast.className = 'toast';
-            toast.innerHTML = `<i class="fas fa-info-circle"></i> ${message}`;
-            document.body.appendChild(toast);
-            setTimeout(() => toast.remove(), 2500);
-        }
-
-        function updateBotStatus(running) {
-            const dot = document.getElementById('statusDot');
-            const text = document.getElementById('statusText');
-            if (running) {
-                dot.className = 'status-dot running';
-                text.textContent = 'Running';
-                botStartTime = Date.now();
-                if (uptimeInterval) clearInterval(uptimeInterval);
-                uptimeInterval = setInterval(() => {
-                    if (botStartTime) {
-                        const elapsed = Math.floor((Date.now() - botStartTime) / 1000);
-                        document.getElementById('uptime').textContent = `${String(Math.floor(elapsed/3600)).padStart(2,'0')}:${String(Math.floor((elapsed%3600)/60)).padStart(2,'0')}:${String(elapsed%60).padStart(2,'0')}`;
-                    }
-                }, 1000);
-                loggedUsernames.clear();
-            } else {
-                dot.className = 'status-dot stopped';
-                text.textContent = 'Stopped';
-                if (uptimeInterval) clearInterval(uptimeInterval);
-                document.getElementById('uptime').textContent = '00:00:00';
-                currentProgress = { processed: 0, total: 0 };
-                updateProgressBar();
+        function renderResults() {
+            const tbody = document.getElementById('resultsBody');
+            if (allResults.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5">No results yet...</td></tr>';
+                return;
             }
+            
+            tbody.innerHTML = allResults.map(r => `
+                <tr>
+                    <td class="${r.status === '✅' ? 'success' : r.status === '❌' ? 'error' : 'timeout'}">${r.status}</td>
+                    <td>${escapeHtml(r.username)}</td>
+                    <td>${escapeHtml(r.password)}</td>
+                    <td>${r.balance || '0'}</td>
+                    <td>${escapeHtml(r.error || '-')}</td>
+                </tr>
+            `).join('');
         }
-
-        function clearTerminal() { document.getElementById('terminal').innerHTML = '<div class="terminal-line">🧹 Terminal cleared</div>'; }
+        
+        function updateStats() {
+            document.getElementById('totalCount').innerHTML = allResults.length;
+            document.getElementById('successCount').innerHTML = allResults.filter(r => r.status === '✅').length;
+            document.getElementById('failedCount').innerHTML = allResults.filter(r => r.status === '❌').length;
+            document.getElementById('timeoutCount').innerHTML = allResults.filter(r => r.status === '⏰').length;
+        }
+        
+        function addLog(message) {
+            const terminal = document.getElementById('terminal');
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.innerHTML = `[${time}] ${message}`;
+            terminal.appendChild(div);
+            div.scrollIntoView();
+            while (terminal.children.length > 100) terminal.removeChild(terminal.firstChild);
+        }
+        
+        function escapeHtml(str) {
+            if (!str) return '';
+            return str.replace(/[&<>]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[m]);
+        }
         
         async function startBot() {
             const accounts = document.getElementById('accounts').value;
-            if (!accounts.trim()) { addTerminalLine('❌ Please enter accounts first!', 'error'); return; }
-            addTerminalLine('🚀 Starting bot...', 'info');
-            loggedUsernames.clear();
+            if (!accounts.trim()) {
+                addLog('❌ Please enter accounts first!');
+                return;
+            }
+            addLog('🚀 Starting bot...');
             try {
                 const response = await fetch('/start', { method: 'POST', body: accounts });
                 const data = await response.json();
-                if (data.status === 'started') { allResults = []; renderResults(); updateStats(); currentProgress = { processed: 0, total: 0 }; updateProgressBar(); }
-            } catch(e) { addTerminalLine(`❌ Error: ${e.message}`, 'error'); }
+                if (data.status === 'started') {
+                    allResults = [];
+                    renderResults();
+                    updateStats();
+                    document.getElementById('progressBar').style.width = '0%';
+                    addLog(`✅ Started processing ${data.total} accounts`);
+                }
+            } catch(e) {
+                addLog(`❌ Error: ${e.message}`);
+            }
         }
-
+        
         async function stopBot() {
-            addTerminalLine('⏹ Stopping bot...', 'warning');
-            try { await fetch('/stop', { method: 'POST' }); } catch(e) { addTerminalLine(`❌ Error: ${e.message}`, 'error'); }
+            addLog('⏹ Stopping bot...');
+            try {
+                await fetch('/stop', { method: 'POST' });
+                addLog('✅ Bot stopped');
+            } catch(e) {
+                addLog(`❌ Error: ${e.message}`);
+            }
         }
-
-        async function clearAllAccounts() {
+        
+        async function clearAccounts() {
             document.getElementById('accounts').value = '';
-            originalAccounts = '';
-            localStorage.removeItem('bot_accounts');
-            updateAccountsCount();
-            addTerminalLine('🗑 All accounts cleared', 'info');
-            try { await fetch('/accounts', { method: 'DELETE' }); } catch(e) {}
+            addLog('🗑 All accounts cleared');
         }
-
+        
+        function clearResults() {
+            allResults = [];
+            renderResults();
+            updateStats();
+            addLog('🗑 Results cleared');
+        }
+        
+        function loadSample() {
+            document.getElementById('accounts').value = 'testuser1:password123\\ntestuser2:password456\\ntestuser3:password789';
+            addLog('📝 Sample accounts loaded');
+        }
+        
         async function loadResults() {
             try {
                 const response = await fetch('/results');
                 const data = await response.json();
-                if (Array.isArray(data) && data.length > 0) { allResults = data; data.forEach(r => loggedUsernames.add(r.username)); renderResults(); updateStats(); }
+                if (Array.isArray(data) && data.length > 0) {
+                    allResults = data;
+                    renderResults();
+                    updateStats();
+                }
             } catch(e) {}
         }
-
-        function refreshResults() { loadResults(); showToast('Results refreshed'); }
         
-        function updateAccountsCount() {
-            const textarea = document.getElementById('accounts');
-            const lines = textarea.value.split('\\n').filter(l => l.trim() && l.includes(':')).length;
-            document.getElementById('accountsCount').innerHTML = `${lines} accounts loaded`;
-            originalAccounts = textarea.value;
-            localStorage.setItem('bot_accounts', textarea.value);
-        }
-
-        function loadSample() {
-            const sample = `user1:pass123\\nuser2:pass456\\nuser3:pass789`;
-            document.getElementById('accounts').value = sample;
-            originalAccounts = sample;
-            updateAccountsCount();
-            addTerminalLine('📝 Sample accounts loaded', 'info');
-        }
-
-        function exportLogs() {
-            const term = document.getElementById('terminal');
-            const logs = Array.from(term.children).map(l => l.textContent).join('\\n');
-            const blob = new Blob([logs], { type: 'text/plain' });
-            const a = document.createElement('a');
-            a.href = URL.createObjectURL(blob);
-            a.download = `logs_${new Date().toISOString().slice(0,19).replace(/:/g,'-')}.txt`;
-            a.click();
-            URL.revokeObjectURL(a.href);
-            showToast('Logs exported');
-        }
-
-        window.addEventListener('load', () => {
-            const saved = localStorage.getItem('bot_accounts');
-            if (saved) { document.getElementById('accounts').value = saved; originalAccounts = saved; updateAccountsCount(); }
-            const textarea = document.getElementById('accounts');
-            textarea.addEventListener('input', updateAccountsCount);
-            document.getElementById('searchInput').addEventListener('input', renderResults);
-            const searchInput = document.getElementById('accountsSearchInput');
-            searchInput.addEventListener('input', function() {
-                const term = this.value.toLowerCase();
-                if (!term && originalAccounts) document.getElementById('accounts').value = originalAccounts;
-                else if (term && originalAccounts) {
-                    const filtered = originalAccounts.split('\\n').filter(l => l.toLowerCase().includes(term)).join('\\n');
-                    document.getElementById('accounts').value = filtered;
-                }
-                updateAccountsCount();
-            });
-            connectWebSocket();
-            loadResults();
-            setInterval(loadResults, 2000);
-        });
+        // Auto-refresh results every 3 seconds
+        setInterval(loadResults, 3000);
+        
+        // Initialize
+        connectWebSocket();
+        loadResults();
     </script>
 </body>
 </html>'''
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger = Logger()
     logger.info("=" * 50)
-    logger.info("ADJARABET BOT v12.0 - OPTIMIZED")
+    logger.info("ADJARABET BOT v13.0 - ENHANCED")
     logger.info("=" * 50)
     
     await bot.initialize()
     
     yield
     
-    # Shutdown
     logger.info("Shutting down...")
     if processing_task and not processing_task.done():
         processing_task.cancel()
@@ -887,7 +733,7 @@ async def lifespan(app: FastAPI):
     await bot.cleanup()
     logger.info("Shutdown complete")
 
-app = FastAPI(title="Adjarabet Bot API", version="12.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot API", version="13.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -912,7 +758,6 @@ async def start_bot(request: Request):
         if not content.strip():
             return JSONResponse({"status": "error", "message": "No accounts provided"}, status_code=400)
         
-        # Parse accounts
         accounts = []
         for line in content.splitlines():
             line = line.strip()
@@ -926,7 +771,6 @@ async def start_bot(request: Request):
         if not accounts:
             return JSONResponse({"status": "error", "message": "No valid accounts found"}, status_code=400)
         
-        # Stop existing task
         if processing_task and not processing_task.done():
             processing_task.cancel()
             try:
@@ -934,7 +778,6 @@ async def start_bot(request: Request):
             except:
                 pass
         
-        # Start new processing
         async def run():
             try:
                 await manager.broadcast("STATUS:started")
@@ -1007,11 +850,15 @@ if __name__ == "__main__":
     Path("logs").mkdir(exist_ok=True)
     
     print("=" * 50)
-    print("🎮 ADJARABET BOT v12.0 - OPTIMIZED")
+    print("🎮 ADJARABET BOT v13.0 - ENHANCED")
     print("=" * 50)
     print(f"📍 Server: http://{PRODUCTION_CONFIG['host']}:{PRODUCTION_CONFIG['port']}")
     print(f"🔧 Headless: {PRODUCTION_CONFIG['headless']}")
     print(f"⏱ Timeout: {PRODUCTION_CONFIG['timeout']}ms")
+    print(f"🔄 Max Retries: {PRODUCTION_CONFIG['max_retries']}")
+    print("=" * 50)
+    print("⚠️  If login fails, check if selectors need updating")
+    print("💡 Debug screenshots saved to logs/debug_*.png")
     print("=" * 50)
     
     uvicorn.run(
