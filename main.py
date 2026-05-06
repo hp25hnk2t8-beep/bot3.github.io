@@ -110,7 +110,7 @@ class Bot:
         self.log = Logger()
         self.playwright = None
         self.browser = None
-        # ❌ Remove: self.context = None (we'll create per-account contexts)
+        self.context = None
         self.is_running = False
         self.results: List[Account] = []
         self.total_accounts = 0
@@ -118,7 +118,7 @@ class Bot:
         self.manager: Optional[ConnectionManager] = None
     
     async def initialize(self):
-        """Initialize Playwright and browser ONCE"""
+        """Initialize browser once"""
         try:
             self.log.info("Initializing Playwright...")
             self.playwright = await async_playwright().start()
@@ -135,6 +135,12 @@ class Bot:
                 ]
             )
             
+            self.context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True
+            )
+            
             self.is_running = True
             self.log.info("Browser initialized successfully")
             return True
@@ -146,6 +152,12 @@ class Bot:
     async def cleanup(self):
         """Clean up resources"""
         self.is_running = False
+        
+        if self.context:
+            try:
+                await self.context.close()
+            except:
+                pass
         
         if self.browser:
             try:
@@ -162,122 +174,73 @@ class Bot:
         self.log.info("Cleanup completed")
     
     async def login_account(self, account: Account) -> Account:
-        """
-        Login single account using its OWN browser context
-        This ensures NO session/cookie sharing between accounts
-        """
-        context = None
+        """Login single account"""
         page = None
         
         try:
-            # ✅ CREATE A NEW CONTEXT FOR EACH ACCOUNT
-            # This is the key fix - each context is like an incognito window
-            context = await self.browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True
-            )
-            
-            page = await context.new_page()
+            page = await self.context.new_page()
             page.set_default_timeout(PRODUCTION_CONFIG["timeout"])
             
-            # Clear all cookies first (just to be extra safe)
-            await context.clear_cookies()
-            
             await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-            await asyncio.sleep(1)  # Slightly longer initial wait
+            await asyncio.sleep(0.5)
             
-            # ✅ REMOVED: Check for "already logged in" - because with new context
-            # this should NEVER happen, and it was causing the balance issue
-            
-            # Look for login form directly
+            # Check if already logged in
             try:
-                # Wait for the login form
+                balance_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=3000)
+                if balance_el:
+                    balance_text = await balance_el.inner_text()
+                    account.balance = balance_text
+                    account.balance_value = self._parse_balance(balance_text)
+                    account.status = AccountStatus.SUCCESS
+                    self.log.info(f"✅ {account.username} | {balance_text}")
+                    return account
+            except:
+                pass
+            
+            # Login form
+            try:
                 await page.wait_for_selector('input[name="userIdentifier"]', timeout=10000)
-                
-                # Clear fields first (sometimes autofill happens)
-                await page.fill('input[name="userIdentifier"]', '')
-                await asyncio.sleep(0.2)
                 await page.fill('input[name="userIdentifier"]', account.username)
                 await asyncio.sleep(0.3)
-                
-                await page.fill('input[type="password"]', '')
-                await asyncio.sleep(0.2)
                 await page.fill('input[type="password"]', account.password)
                 await asyncio.sleep(0.3)
-                
-                # Click login button and wait for navigation/response
                 await page.click('[data-test-id="header-login-button"]')
                 
-                # Wait for balance to appear (indicates successful login)
+                # Wait for balance
                 balance_el = await page.wait_for_selector(
                     '[data-test-id="header-user-balance"]', 
-                    timeout=20000
+                    timeout=15000
                 )
                 
-                # Get balance text
                 balance_text = await balance_el.inner_text()
-                balance_text = balance_text.strip()
-                
                 account.balance = balance_text
                 account.balance_value = self._parse_balance(balance_text)
                 account.status = AccountStatus.SUCCESS
-                account.error = ""
-                self.log.info(f"✅ {account.username} | Balance: {balance_text} | Value: {account.balance_value}")
+                self.log.info(f"✅ {account.username} | {balance_text}")
                 
             except PlaywrightTimeout:
-                # Check if we see error message (wrong credentials)
-                try:
-                    error_el = await page.wait_for_selector('.error-message, [class*="error"], [class*="invalid"]', timeout=3000)
-                    error_text = await error_el.inner_text()
-                    account.status = AccountStatus.FAILED
-                    account.error = f"Login failed: {error_text[:50]}"
-                    account.balance = "0"
-                    account.balance_value = 0.0
-                    self.log.warning(f"❌ {account.username} - {account.error}")
-                except:
-                    account.status = AccountStatus.TIMEOUT
-                    account.error = "Login timeout - no response"
-                    account.balance = "0"
-                    account.balance_value = 0.0
-                    self.log.warning(f"⏰ {account.username} - Timeout")
-            
-            except Exception as e:
-                account.status = AccountStatus.FAILED
-                account.error = str(e)[:100]
-                account.balance = "0"
-                account.balance_value = 0.0
-                self.log.error(f"❌ {account.username}: {str(e)[:80]}")
+                account.status = AccountStatus.TIMEOUT
+                account.error = "Login timeout"
+                self.log.warning(f"⏰ {account.username} - Timeout")
             
             return account
             
         except Exception as e:
             account.status = AccountStatus.FAILED
-            account.error = f"Context error: {str(e)[:80]}"
-            account.balance = "0"
-            account.balance_value = 0.0
-            self.log.error(f"❌ {account.username}: Context error - {str(e)[:80]}")
+            account.error = str(e)[:100]
+            self.log.error(f"❌ {account.username}: {str(e)[:80]}")
             return account
             
         finally:
-            # ✅ ALWAYS close the context (not just the page)
-            # This ensures complete isolation
-            if context:
+            if page:
                 try:
-                    await context.close()
-                except Exception as e:
-                    self.log.debug(f"Error closing context: {e}")
+                    await page.close()
+                except:
+                    pass
     
     def _parse_balance(self, text: str) -> float:
-        """Extract numeric balance value from text"""
-        if not text:
-            return 0.0
         try:
-            # Remove all non-numeric chars except . and ,
-            # First replace commas (thousands separator) with nothing
-            cleaned = text.replace(',', '').replace(' ', '')
-            # Find number pattern (including decimals)
-            match = re.search(r'(\d+\.?\d*)', cleaned)
+            match = re.search(r'([\d,]+\.?\d*)', text.replace(',', ''))
             if match:
                 return float(match.group(1))
         except:
@@ -285,88 +248,63 @@ class Bot:
         return 0.0
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager):
-        """Process all accounts one by one with separate contexts"""
+        """Process all accounts"""
         self.manager = manager
         self.results = []
         self.total_accounts = len(accounts)
         self.processed = 0
         start_time = datetime.now()
         
-        self.log.info(f"📊 Processing {self.total_accounts} accounts with ISOLATED sessions")
-        self.log.info(f"{'='*50}")
+        self.log.info(f"Processing {self.total_accounts} accounts")
         
         for i, account in enumerate(accounts, 1):
             if not self.is_running:
-                self.log.info(f"⏹ Bot stopped by user after processing {i-1} accounts")
                 break
             
-            self.log.info(f"🔄 [{i}/{self.total_accounts}] Checking: {account.username}")
-            
-            # Process each account with its own fresh context
             result = await self.login_account(account)
             self.results.append(result)
             self.processed = i
             
-            # Save results after each account (for crash recovery)
+            # Save results
             await self._save_results()
             
-            # Send real-time updates via WebSocket
+            # Send real-time updates
             await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
             await manager.broadcast(f"PROGRESS:{i}/{self.total_accounts}")
             
-            # Small delay between accounts
             await asyncio.sleep(0.5)
         
-        # Calculate and send summary
+        # Send summary
         successful = sum(1 for r in self.results if r.status == AccountStatus.SUCCESS)
-        failed = sum(1 for r in self.results if r.status == AccountStatus.FAILED)
-        timeouts = sum(1 for r in self.results if r.status == AccountStatus.TIMEOUT)
         rate = (successful / self.total_accounts * 100) if self.total_accounts > 0 else 0
         
-        # Find accounts with non-zero balance
-        with_balance = sum(1 for r in self.results if r.balance_value > 0)
-        total_balance = sum(r.balance_value for r in self.results)
-        
-        summary_msg = f"SUMMARY:{successful}/{self.total_accounts}:{rate:.1f}"
-        await manager.broadcast(summary_msg)
+        await manager.broadcast(f"SUMMARY:{successful}/{self.total_accounts}:{rate:.1f}")
         await manager.broadcast("STATUS:stopped")
         
         duration = (datetime.now() - start_time).total_seconds()
-        self.log.info(f"{'='*50}")
-        self.log.info(f"✅ COMPLETED: {successful}/{self.total_accounts} ({rate:.1f}%) in {duration:.1f}s")
-        self.log.info(f"💰 Accounts with balance: {with_balance} | Total: {total_balance:.2f}")
-        self.log.info(f"❌ Failed: {failed} | ⏰ Timeouts: {timeouts}")
-        self.log.info(f"{'='*50}")
+        self.log.info(f"Completed: {successful}/{self.total_accounts} ({rate:.1f}%) in {duration:.1f}s")
     
     async def _save_results(self):
-        """Save results to JSON file"""
         try:
             results_file = Path(PRODUCTION_CONFIG["results_dir"]) / "results.json"
             results_file.parent.mkdir(exist_ok=True)
             
             data = [r.to_dict() for r in self.results]
-            # Sort by balance_value descending
-            data.sort(key=lambda x: x.get('balance_value', 0), reverse=True)
-            
             async with aiofiles.open(results_file, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, indent=2, ensure_ascii=False))
         except Exception as e:
             self.log.error(f"Failed to save results: {e}")
     
     async def get_results(self) -> List[Dict]:
-        """Get current results"""
         if self.results:
-            data = [r.to_dict() for r in self.results]
-            data.sort(key=lambda x: x.get('balance_value', 0), reverse=True)
-            return data
+            return [r.to_dict() for r in self.results]
         
         try:
             results_file = Path(PRODUCTION_CONFIG["results_dir"]) / "results.json"
             if results_file.exists():
                 async with aiofiles.open(results_file, "r", encoding="utf-8") as f:
                     content = await f.read()
-                    if content:
-                        return json.loads(content)
+                    return json.loads(content) if content else []
         except:
             pass
         
@@ -377,7 +315,7 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-# HTML UI (your provided UI - unchanged)
+# HTML UI (your provided UI)
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
@@ -711,7 +649,7 @@ HTML_UI = '''<!DOCTYPE html>
 
         function parseBalance(balanceStr) {
             if (!balanceStr) return 0;
-            const match = balanceStr.match(/[\d,.]+/);
+            const match = balanceStr.match(/[\\d,.]+/);
             return match ? parseFloat(match[0].replace(/,/g, '')) : 0;
         }
 
@@ -879,14 +817,14 @@ HTML_UI = '''<!DOCTYPE html>
         
         function updateAccountsCount() {
             const textarea = document.getElementById('accounts');
-            const lines = textarea.value.split('\n').filter(l => l.trim() && l.includes(':')).length;
+            const lines = textarea.value.split('\\n').filter(l => l.trim() && l.includes(':')).length;
             document.getElementById('accountsCount').innerHTML = `${lines} accounts loaded`;
             originalAccounts = textarea.value;
             localStorage.setItem('bot_accounts', textarea.value);
         }
 
         function loadSample() {
-            const sample = `user1:pass123\nuser2:pass456\nuser3:pass789`;
+            const sample = `user1:pass123\\nuser2:pass456\\nuser3:pass789`;
             document.getElementById('accounts').value = sample;
             originalAccounts = sample;
             updateAccountsCount();
@@ -895,7 +833,7 @@ HTML_UI = '''<!DOCTYPE html>
 
         function exportLogs() {
             const term = document.getElementById('terminal');
-            const logs = Array.from(term.children).map(l => l.textContent).join('\n');
+            const logs = Array.from(term.children).map(l => l.textContent).join('\\n');
             const blob = new Blob([logs], { type: 'text/plain' });
             const a = document.createElement('a');
             a.href = URL.createObjectURL(blob);
@@ -916,7 +854,7 @@ HTML_UI = '''<!DOCTYPE html>
                 const term = this.value.toLowerCase();
                 if (!term && originalAccounts) document.getElementById('accounts').value = originalAccounts;
                 else if (term && originalAccounts) {
-                    const filtered = originalAccounts.split('\n').filter(l => l.toLowerCase().includes(term)).join('\n');
+                    const filtered = originalAccounts.split('\\n').filter(l => l.toLowerCase().includes(term)).join('\\n');
                     document.getElementById('accounts').value = filtered;
                 }
                 updateAccountsCount();
@@ -934,7 +872,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger = Logger()
     logger.info("=" * 50)
-    logger.info("ADJARABET BOT v12.0 - FIXED (ISOLATED CONTEXTS)")
+    logger.info("ADJARABET BOT v12.0 - OPTIMIZED")
     logger.info("=" * 50)
     
     await bot.initialize()
@@ -1014,7 +952,7 @@ async def start_bot(request: Request):
         
         processing_task = asyncio.create_task(run())
         
-        return JSONResponse({"status": "started", "message": f"Processing {len(accounts)} accounts with isolated sessions", "total": len(accounts)})
+        return JSONResponse({"status": "started", "message": f"Processing {len(accounts)} accounts", "total": len(accounts)})
         
     except Exception as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
@@ -1073,12 +1011,11 @@ if __name__ == "__main__":
     Path("logs").mkdir(exist_ok=True)
     
     print("=" * 50)
-    print("🎮 ADJARABET BOT v12.0 - FIXED (ISOLATED CONTEXTS)")
+    print("🎮 ADJARABET BOT v12.0 - OPTIMIZED")
     print("=" * 50)
     print(f"📍 Server: http://{PRODUCTION_CONFIG['host']}:{PRODUCTION_CONFIG['port']}")
     print(f"🔧 Headless: {PRODUCTION_CONFIG['headless']}")
     print(f"⏱ Timeout: {PRODUCTION_CONFIG['timeout']}ms")
-    print(f"💡 FIX: Each account now uses its OWN browser context (incognito)")
     print("=" * 50)
     
     uvicorn.run(
