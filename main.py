@@ -28,7 +28,6 @@ PRODUCTION_CONFIG = {
     "results_dir": os.getenv("RESULTS_DIR", "results"),
     "log_file": os.getenv("LOG_FILE", "logs/bot.log"),
     "browser_type": os.getenv("BROWSER_TYPE", "chromium"),
-    "user_data_dir": os.getenv("USER_DATA_DIR", "/tmp/playwright_profile"),
 }
 
 # ================= PRODUCTION LOGGER =================
@@ -39,10 +38,8 @@ class ProductionLogger:
         self.logger = logging.getLogger("AdjarabetBot")
         self.logger.setLevel(getattr(logging, PRODUCTION_CONFIG["log_level"]))
         
-        # Clear existing handlers
         self.logger.handlers.clear()
         
-        # File handler
         file_handler = logging.FileHandler(PRODUCTION_CONFIG["log_file"], encoding="utf-8")
         console_handler = logging.StreamHandler()
         
@@ -119,80 +116,31 @@ class ConnectionManager:
         for conn in disconnected:
             self.disconnect(conn)
 
-# ================= SIMPLE BOT WITH BETTER ERROR HANDLING =================
+# ================= FIXED BOT - NEW CONTEXT PER ACCOUNT =================
 class SimpleBot:
     def __init__(self):
         self.log = ProductionLogger()
         self.playwright = None
-        self.browser = None
-        self.context = None
         self.is_running = False
         self.results: List[Account] = []
         self.total_accounts = 0
         self.processed = 0
         
     async def initialize(self):
-        """Initialize browser once"""
+        """Initialize Playwright (browser engine, not shared context)"""
         try:
             self.log.info("Initializing Playwright...")
             self.playwright = await async_playwright().start()
-            
-            self.log.info(f"Launching browser (headless={PRODUCTION_CONFIG['headless']})...")
-            
-            # Clean up old user data dir
-            import shutil
-            user_data_dir = Path(PRODUCTION_CONFIG["user_data_dir"])
-            if user_data_dir.exists():
-                try:
-                    shutil.rmtree(user_data_dir)
-                except:
-                    pass
-            user_data_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Launch browser with persistent context
-            self.browser = await self.playwright.chromium.launch(
-                headless=PRODUCTION_CONFIG["headless"],
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-accelerated-2d-canvas',
-                    '--disable-infobars',
-                    '--window-size=1280,720'
-                ]
-            )
-            
-            # Create context
-            self.context = await self.browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                ignore_https_errors=True
-            )
-            
             self.is_running = True
-            self.log.info("✅ Browser initialized successfully")
+            self.log.info("✅ Playwright initialized successfully")
             return True
-            
         except Exception as e:
-            self.log.error(f"Failed to initialize browser: {e}")
+            self.log.error(f"Failed to initialize Playwright: {e}")
             return False
     
     async def cleanup(self):
         """Clean up resources"""
         self.is_running = False
-        
-        if self.context:
-            try:
-                await self.context.close()
-            except:
-                pass
-        
-        if self.browser:
-            try:
-                await self.browser.close()
-            except:
-                pass
         
         if self.playwright:
             try:
@@ -203,12 +151,35 @@ class SimpleBot:
         self.log.info("🧹 Cleanup completed")
     
     async def login_account(self, account: Account) -> Account:
-        """Login single account with better error handling"""
+        """Login single account with FRESH browser context"""
+        browser = None
+        context = None
         page = None
         
         try:
-            # Create new page
-            page = await self.context.new_page()
+            # Launch NEW browser for each account (or new context if you prefer)
+            # For better performance, we use new context with isolated storage
+            browser = await self.playwright.chromium.launch(
+                headless=PRODUCTION_CONFIG["headless"],
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--window-size=1280,720'
+                ]
+            )
+            
+            # Create FRESH context with no cookies/localStorage from previous accounts
+            context = await browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True,
+                # Important: no shared storage
+                storage_state=None
+            )
+            
+            page = await context.new_page()
             
             # Set timeouts
             page.set_default_timeout(PRODUCTION_CONFIG["timeout"])
@@ -218,21 +189,7 @@ class SimpleBot:
             self.log.debug(f"Navigating to login page for {account.username}")
             await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
             
-            # Small random delay
-            await asyncio.sleep(0.5)
-            
-            # Check if already logged in
-            try:
-                balance_element = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=5000)
-                if balance_element:
-                    balance_text = await balance_element.inner_text()
-                    account.balance = balance_text
-                    account.balance_value = self._parse_balance(balance_text)
-                    account.status = AccountStatus.SUCCESS
-                    self.log.info(f"✅ {account.username} - Already logged in | Balance: {balance_text}")
-                    return account
-            except:
-                pass
+            await asyncio.sleep(1)  # Let page stabilize
             
             # Wait for login form
             try:
@@ -243,11 +200,14 @@ class SimpleBot:
                 self.log.warning(f"⏰ {account.username} - Login form not found")
                 return account
             
-            # Fill username
+            # Clear fields first
+            await page.fill('input[name="userIdentifier"]', '')
+            await asyncio.sleep(0.2)
             await page.fill('input[name="userIdentifier"]', account.username)
             await asyncio.sleep(0.3)
             
-            # Fill password
+            await page.fill('input[type="password"]', '')
+            await asyncio.sleep(0.2)
             await page.fill('input[type="password"]', account.password)
             await asyncio.sleep(0.3)
             
@@ -263,7 +223,7 @@ class SimpleBot:
                 )
                 
                 balance_text = await balance_element.inner_text()
-                account.balance = balance_text
+                account.balance = balance_text.strip()
                 account.balance_value = self._parse_balance(balance_text)
                 account.status = AccountStatus.SUCCESS
                 self.log.info(f"✅ {account.username} - Login successful | Balance: {balance_text}")
@@ -271,15 +231,32 @@ class SimpleBot:
             except PlaywrightTimeout:
                 # Check if login failed
                 try:
-                    error_element = await page.wait_for_selector('[class*="error"]', timeout=2000)
-                    if error_element:
-                        error_text = await error_element.inner_text()
+                    # Try to find error message
+                    error_selectors = [
+                        '[class*="error"]',
+                        '[class*="alert"]',
+                        '.error-message',
+                        '.alert-danger'
+                    ]
+                    error_text = ""
+                    for selector in error_selectors:
+                        try:
+                            error_element = await page.wait_for_selector(selector, timeout=1000)
+                            if error_element:
+                                error_text = await error_element.inner_text()
+                                break
+                        except:
+                            continue
+                    
+                    if error_text:
                         account.error = error_text[:100]
+                    else:
+                        account.error = "Login timeout - balance not found"
                 except:
                     pass
                 
                 account.status = AccountStatus.FAILED
-                account.error = account.error or "Login timeout - balance not found"
+                account.error = account.error or "Login failed"
                 self.log.warning(f"❌ {account.username} - Login failed: {account.error}")
             
             return account
@@ -291,25 +268,37 @@ class SimpleBot:
             return account
             
         finally:
+            # Clean up - CLOSE everything for this account
             if page:
                 try:
                     await page.close()
+                except:
+                    pass
+            if context:
+                try:
+                    await context.close()
+                except:
+                    pass
+            if browser:
+                try:
+                    await browser.close()
                 except:
                     pass
     
     def _parse_balance(self, text: str) -> float:
         """Parse balance from text"""
         try:
-            # Extract numbers from balance text
-            match = re.search(r'([\d,]+\.?\d*)', text.replace(',', ''))
+            # Remove currency symbols and spaces
+            clean_text = text.replace('₾', '').replace('GEL', '').replace(',', '').strip()
+            match = re.search(r'([\d]+\.?[\d]*)', clean_text)
             if match:
                 return float(match.group(1))
-        except:
-            pass
+        except Exception as e:
+            self.log.debug(f"Balance parse error: {e}")
         return 0.0
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager) -> Dict[str, Any]:
-        """Process all accounts"""
+        """Process all accounts - each with fresh browser context"""
         if not self.is_running:
             await self.initialize()
         
@@ -325,12 +314,14 @@ class SimpleBot:
             if not self.is_running:
                 break
             
-            # Process account
+            self.log.info(f"🔄 Processing account {i}/{self.total_accounts}: {account.username}")
+            
+            # Process account with FRESH browser
             result = await self.login_account(account)
             self.results.append(result)
             self.processed = i
             
-            # Save results
+            # Save results after each account
             await self._save_results()
             
             # Broadcast progress
@@ -340,8 +331,8 @@ class SimpleBot:
             # Broadcast result
             await manager.broadcast(f"result:{json.dumps(result.to_dict())}")
             
-            # Small delay between accounts
-            await asyncio.sleep(1)
+            # Delay between accounts to avoid rate limiting
+            await asyncio.sleep(2)
         
         # Calculate statistics
         duration = (datetime.now() - start_time).total_seconds()
@@ -357,6 +348,13 @@ class SimpleBot:
         }
         
         self.log.info(f"📈 Completed: {successful}/{self.total_accounts} ({stats['success_rate']:.1f}%) in {duration:.1f}s")
+        
+        # Send unique balances summary
+        unique_balances = set(r.balance for r in self.results if r.status == AccountStatus.SUCCESS)
+        self.log.info(f"💰 Unique balances found: {len(unique_balances)}")
+        for balance in sorted(unique_balances):
+            self.log.info(f"   - {balance}")
+        
         await manager.broadcast(f"complete:{json.dumps(stats)}")
         
         return stats
@@ -418,7 +416,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger = ProductionLogger()
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT PRO v12.0 - OPTIMIZED")
+    logger.info("🎮 ADJARABET BOT PRO v13.0 - FIXED BALANCE ISSUE")
     logger.info("=" * 50)
     
     # Initialize bot
@@ -440,7 +438,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Adjarabet Bot API",
-    version="12.0",
+    version="13.0",
     lifespan=lifespan
 )
 
@@ -452,12 +450,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTML interface
+# HTML interface (same as before, but improved)
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Adjarabet Bot</title>
+    <title>Adjarabet Bot - Fixed Balance</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #1a1a2e; color: #eee; padding: 20px; }
@@ -476,17 +474,22 @@ HTML_PAGE = """
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { padding: 10px; text-align: left; border-bottom: 1px solid #0f3460; }
         th { background: #0f3460; }
-        .success { color: #00ff00; }
+        .success { color: #00ff00; font-weight: bold; }
         .failed { color: #ff0000; }
         .timeout { color: #ffaa00; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-bottom: 20px; }
         .stat-card { background: #0f3460; padding: 15px; border-radius: 5px; text-align: center; }
         .stat-value { font-size: 24px; font-weight: bold; margin-top: 5px; }
+        .warning { background: #ffaa0022; border-left: 3px solid #ffaa00; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>🎮 Adjarabet Bot</h1>
+        <h1>🎮 Adjarabet Bot v13 - Fixed Balance</h1>
+        
+        <div class="warning">
+            ⚡ Յուրաքանչյուր ակաունթ մշակվում է առանձին բրաուզերով - բալանսները ճիշտ են ցուցադրվում
+        </div>
         
         <div class="card">
             <h3>Controls</h3>
@@ -514,7 +517,7 @@ HTML_PAGE = """
             <div style="overflow-x: auto;">
                 <table id="results">
                     <thead>
-                        <tr><th>Username</th><th>Balance</th><th>Status</th><th>Error</th></tr>
+                        <tr><th>Username</th><th>Balance</th><th>Balance (numeric)</th><th>Status</th><th>Error</th></tr>
                     </thead>
                     <tbody></tbody>
                 </table>
@@ -562,8 +565,9 @@ HTML_PAGE = """
             row.innerHTML = `
                 <td>${escapeHtml(result.username)}</td>
                 <td>${escapeHtml(result.balance)}</td>
+                <td>${result.balance_value.toFixed(2)}</td>
                 <td class="${result.status}">${result.status}</td>
-                <td>${escapeHtml(result.error || '')}</td>
+                <td>${escapeHtml(result.error || '-')}</td>
             `;
         }
         
@@ -587,203 +591,598 @@ HTML_PAGE = """
             }
             
             document.getElementById('startBtn').disabled = true;
-            document.getElementById('stopBtn').disabled = false;
-            document.getElementById('status').className = 'status running';
-            document.getElementById('status').textContent = 'Running';
-            document.getElementById('results').getElementsByTagName('tbody')[0].innerHTML = '';
-            document.getElementById('progressFill').style.width = '0%';
-            document.getElementById('progressFill').textContent = '0%';
-            document.getElementById('stats').innerHTML = '';
+            document.getElementById(' true;
+            document.getElementById(' true;
+            document.getElementById('stopBtnstopBtn').disabledstopBtn').disabled').disabled = false;
+            = false;
+            = false;
+            document.getElementById document.getElementById document.getElementById('status').className('status').className = '('status').className = ' = 'status runningstatus runningstatus running';
+           ';
+            document.getElementById';
+            document.getElementById document.getElementById('status('status('status').textContent =').text').textContent = 'Running 'RunningContent = 'Running';
+           ';
+           ';
+            document.getElementById document.getElementById document.getElementById('results('results('results').get').getElementsBy').getElementsByTagNameElementsByTagName('tbodyTagName('tbody('tbody')[0')[0')[0].innerHTML = '';
+           ].innerHTML =].innerHTML = '';
+            document.getElementById '';
+            document.getElementById document.getElementById('progress('progressFill').('progressFill').Fill').style.widthstyle.widthstyle.width = '0% = ' = '0%';
+           0%';
+           ';
+            document.getElementById(' document.getElementById('progress document.getElementByIdprogressFill').Fill').textContent('progressFill').textContenttextContent = ' = ' = '0%0%';
+           0%';
+           ';
+            document.getElementById document.getElementById document.getElementById('stats('stats').inner('stats').innerHTML =').innerHTML =HTML = '';
             
-            try {
-                const response = await fetch('/start', {
-                    method: 'POST',
+            try '';
+            
+ '';
+            
+ {
+                           try {
+                const response            try {
+                const response const response = await fetch('/ = await = awaitstart', fetch('/ fetch('/start', {
+                    {
+                   start', {
+                    method: method: method: 'POST 'POST 'POST',
+                    body: accounts
+',
+                    body: accounts
+',
                     body: accounts
                 });
-                const data = await response.json();
-                if (data.status !== 'started') {
-                    alert('Error: ' + data.message);
-                    document.getElementById('startBtn').disabled = false;
-                    document.getElementById('stopBtn').disabled = true;
-                    document.getElementById('status').className = 'status stopped';
-                    document.getElementById('status').textContent = 'Stopped';
+                });
+                const                });
+                const                const data = data = data = await response.json();
+ await response await response                if.json();
+                if (data.json();
+                if (data (data.status !==.status !==.status !== 'start 'start 'started')ed')ed') {
+                    {
+                    {
+                    alert(' alert('Error: alert('Error: ' +Error: ' + data.message ' + data.message);
+                   );
+                    data.message);
+                    document.getElementById document.getElementById document.getElementById('startBtn').('startBtn').('startBtn').disabled =disabled =disabled = false;
+ false;
+                    document false;
+                    document.getElementById('                    document.getElementById('stopBtnstopBtn.getElementById('stopBtn').disabled = true').disabled = true').disabled = true;
+                   ;
+                   ;
+                    document.getElementById document.getElementById('status document.getElementById('status').className('status').className = '').className = ' = 'status stopped';
+                   status stopped';
+                   status stopped';
+                    document.getElementById('status document.getElementById('status document.getElementById('status').textContent = 'St').textContent = 'St').textContent = 'Stopped';
                 }
-            } catch (error) {
-                alert('Error: ' + error.message);
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
+           opped';
+                }
+           opped';
+                }
+            } catch } catch } catch (error) {
+ (error) {
+ (error) {
+                alert                alert                alert('Error('Error: ' + error('Error: ' + error: ' + error.message);
+.message);
+.message);
+                document.getElementById('                document.getElementById('                document.getElementById('startBtnstartBtnstartBtn').disabled').disabled = false;
+               ').disabled = false;
+                = false;
+                document.getElementById document.getElementById document.getElementById('stop('stop('stopBtn').Btn').disabled =Btn').disabled =disabled = true;
+            }
+        }
+ true;
+            }
+        }
+ true;
             }
         }
         
-        async function stopBot() {
-            try {
-                await fetch('/stop', { method: 'POST' });
-                document.getElementById('startBtn').disabled = false;
-                document.getElementById('stopBtn').disabled = true;
-                document.getElementById('status').className = 'status stopped';
+               
+        async function        
+        async function stopBot async function stopBot() {
+() {
+ stopBot() {
+            try            try            try {
+                {
+                await fetch {
+                await fetch await fetch('/stop('/stop('/stop', {', { method: 'POST', { method: 'POST method: 'POST' });
+' });
+' });
+                document                document.getElementById('                document.getElementById('startBtn.getElementById('startBtnstartBtn').disabled').disabled').disabled = false = false = false;
+                document.getElementById;
+                document.getElementById;
+                document.getElementById('stop('stopBtn').('stopBtn').disabled = true;
+disabled = true;
+Btn').disabled = true;
+                document                document.getElementById('status').                document.getElementById('status')..getElementById('status').className =className =className = 'status 'status 'status stopped';
+                document.getElementById('status').textContent = 'Sto stopped';
+                document.getElementById('status').textContent = 'Sto stopped';
                 document.getElementById('status').textContent = 'Stopped';
-            } catch (error) {
-                console.error('Stop error:', error);
+            }pped';
+            }pped';
+ catch ( catch (            } catch (error)error)error) {
+                console.error {
+                console.error('Stop {
+                console.error('Stop('Stop error:', error);
+            }
+ error:', error);
+            }
+ error:', error);
             }
         }
+        }
+        }
         
+        function escapeHtml(text        
+        function escapeHtml(text        
         function escapeHtml(text) {
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+) {
+) {
+            const            const div =            const div = div = document.createElement document.createElement document.createElement('div('div('div');
+           ');
+           ');
+            div.text div.text div.textContent =Content = text;
+            returnContent = text;
+ text;
+            return div.innerHTML            return div.innerHTML div.innerHTML;
+       ;
         }
         
-        async function loadResults() {
+;
+        }
+        
+ }
+        
+        async        async function load        async function loadResults() function loadResults() {
+            {
+           Results() try {
+ try {
+ {
             try {
-                const response = await fetch('/results');
-                const results = await response.json();
-                const tbody = document.getElementById('results').getElementsByTagName('tbody')[0];
-                tbody.innerHTML = '';
-                results.forEach(result => addResultToTable(result));
-            } catch (error) {
-                console.error('Load results error:', error);
+                const                const response = await fetch                const response = await fetch response = await fetch('/results('/results');
+               ('/results');
+                const results');
+                const results const results = await = await = await response.json response.json response.json();
+               ();
+                const tbody =();
+                const tbody = const tbody = document.getElementById document.getElementById('results document.getElementById('results('results').getElementsBy').getElementsBy').getElementsByTagName('tbodyTagName('tbodyTagName')[0')[0('tbody')[0];
+               ];
+                tbody];
+                tbody tbody.innerHTML =.innerHTML =.innerHTML = '';
+                '';
+                '';
+                results.forEach(result => results.forEach(result => addResult results.forEach(result => addResult addResultToTableToTableToTable(result));
+(result));
+(result));
+            }            } catch (            } catch ( catch (error) {
+               error) {
+               error) {
+                console.error('Load results error:', error console.error('Load results error:', error console.error('Load results error:', error);
+           );
+            }
+       );
             }
         }
+        }
+        
+ }
+        
+ }
         
         connectWebSocket();
-        loadResults();
+               connectWebSocket        connectWebSocket loadResults();
+       ();
+        loadResults loadResults();
+    </script>
+</();
+    </script();
     </script>
 </body>
+>
+</body>
+</htmlbody>
 </html>
 """
 
-@app.get("/")
-async def root():
-    return HTMLResponse(HTML_PAGE)
+>
+"""
 
-@app.get("/api")
-async def api_info():
+@app.get</html@app.get("/")
+>
+"""
+
+@app.get("/")
+("/")
+async defasync def root():
+async def root():
+    return root():
+    return HTMLResponse    return HTMLResponse(HTML(HTML HTMLResponse(HTML_PAGE_PAGE_PAGE)
+
+@app)
+
+@app)
+
+@app.get("/.get("/api")
+.get("/api")
+api")
+async def api_infoasync def api_infoasync def api_info():
+   ():
+   ():
     return {
-        "name": "Adjarabet Bot API",
-        "version": "12.0",
-        "status": "running",
+ return {
+ return {
+        "        "        "name": "Adjarabet Bot APIname": "Adjarabet Bot APIname": "Adjarabet Bot API",
+       ",
+        "",
+        "version "version": "version": "": "13.13.0",
+       13.0",
+        " "status":0",
+        "status":status": "running "running "running",
+       ",
+        "fix",
+        "fix "fix":": "": " "Each account uses freshEach account uses freshEach account uses fresh browser context browser context browser context - balances are - balances are - balances are now now now correct",
+ correct",
+ correct",
+        "endpoints        "endpoints": {
         "endpoints": {
-            "POST /start": "Start bot with accounts",
-            "POST /stop": "Stop bot",
-            "GET /results": "Get results",
-            "GET /health": "Health check",
-            "WS /ws": "WebSocket for updates"
+": {
+            "            "            "POST /POST /start":POST /start": "Startstart": "Start "Start bot with accounts",
+            " bot with accounts",
+            " bot with accounts",
+POST /POST /            "POST /stopstop": "Stopstop": "Stop": "Stop bot",
+ bot",
+ bot",
+            "GET /            "GET /results":            "GET /results":results": "Get "Get "Get results",
+ results",
+            " results",
+            "GET /            "GET /GET /health": "Health check",
+health": "Health check",
+health": "Health check",
+            "            "            "WS /ws":WS /WS / "Webws": "Webws": "WebSocket forSocket forSocket for updates"
+        }
+ updates"
+        }
+ updates"
         }
     }
 
-@app.post("/start")
-async def start_bot(request: Request):
-    global processing_task
+    }
+
+    }
+
+@app.post@app.post@app.post("/start("/start")
+async("/start")
+async")
+async def start def start_bot def start_bot(request_bot(request:(request: Request):
+: Request):
+ Request):
+    global    global    global processing_task
+    
+    processing_task
     
     try:
-        # Get accounts
-        body = await request.body()
-        content = body.decode("utf-8")
+ processing_task
+    
+    try:
+ try:
+        body        body = await        body = await = await request.body request.body()
+        request.body()
+       ()
+        content = content = content = body.decode("utf body.decode("utf body.decode("utf-8-8-8")
         
-        if not content.strip():
-            return JSONResponse({"status": "error", "message": "No accounts provided"}, status_code=400)
+")
         
-        # Load accounts
-        accounts = load_accounts(content)
+        if")
         
+        if not content        if not content not content.strip():
+.strip():
+.strip():
+            return            return JSONResponse            return JSONResponse JSONResponse({"status({"status({"status": "": "error", "message": "error",error",": " "message": " "message": "No accountsNo accountsNo accounts provided"}, provided"}, provided"}, status_code status_code status_code=400=400=400)
+        
+        accounts)
+        
+        accounts)
+        
+        accounts = load = load_accounts = load_accounts_accounts(content)
+(content)
+(content)
+        
+        if not        
+        if not        
         if not accounts:
-            return JSONResponse({"status": "error", "message": "No valid accounts found"}, status_code=400)
+ accounts:
+ accounts:
+            return JSONResponse            return JSONResponse            return JSONResponse({"status({"status": "error",({"status": "": "error", "messageerror", "message "message": "": "": "No valid accounts foundNo valid accounts foundNo valid"}, status"}, status accounts found"}, status_code=400)
         
-        # Stop existing task
-        if processing_task and not processing_task.done():
-            processing_task.cancel()
-            try:
+        if processing_task and_code=400)
+        
+        if processing_task and not processing_task_code=400)
+        
+        if processing_task and not processing not processing_task.d.done():
+_task.done():
+one():
+            processing            processing_task.c            processing_task.cancel()
+_task.cancel()
+ancel()
+            try            try            try:
+               :
+               :
+                await processing_task
+            except await processing_task
+            except:
                 await processing_task
             except:
                 pass
         
-        # Start new processing
-        async def run():
+:
+                pass
+        
+        async        async pass
+        
+ def run def run():
+           ():
             try:
-                await manager.broadcast("info:Bot started")
-                stats = await bot.process_accounts(accounts, manager)
-            except asyncio.CancelledError:
-                await manager.broadcast("info:Bot stopped by user")
-            except Exception as e:
-                await manager.broadcast(f"info:Error: {str(e)}")
+                await try:
+                await        async def run():
+            try:
+                await manager.b manager.broadcast manager.broadcast("info:Botroadcast("info:Bot("info:Bot started - started - started - each account uses fresh each account uses fresh each account uses fresh browser")
+ browser")
+ browser")
+                stats = await bot.process                stats = await bot.process_accounts                stats = await bot.process_accounts_accounts(accounts(accounts(accounts, manager)
+           , manager)
+           , manager)
+            except as except as except asyncio.Cancyncioyncio.CancelledError.CancelledErrorelledError:
+               :
+               :
+                await manager.broad await manager.broadcast(" await manager.broadcast("cast("info:info:info:Bot stopped by user")
+           Bot stopped by user")
+           Bot stopped by user")
+            except Exception except Exception except Exception as e:
+                await manager as e:
+                await manager as e:
+                await manager.broad.broadcast(f.broadcast(f"info"info:Error:Errorcast(f"info:Error: {str(e: {str(e: {str(e)}")
         
-        processing_task = asyncio.create_task(run())
+       )}")
         
-        return JSONResponse({
-            "status": "started",
-            "message": f"Processing {len(accounts)} accounts",
-            "total": len(accounts)
+        processing_task)}")
+        
+        processing_task = as = as processing_task = asyncioyncioyncio.create_task.create_task.create_task(run(run())
+        
+(run())
+        
+())
+        
+        return JSONResponse        return        return({
+            JSONResponse({
+            JSONResponse({
+            "status": " "status": " "status": "startedstarted",
+           started",
+           ",
+            "message "message": f"Processing "message": f"Processing": f"Processing {len {len(accounts {len(accounts(accounts)} accounts)} accounts with fresh)} accounts with fresh with fresh browser per account",
+ browser per account",
+ browser per account",
+            "total":            "total":            "total": len( len( len(accounts)
+accounts)
+        })
+accounts)
+        })
         })
         
-    except Exception as e:
-        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+           
+           
+    except Exception except Exception except Exception as e:
+        as e:
+        return JSON as e:
+        return JSON return JSONResponse({"status":Response({"status":Response({"status": "error", " "error", " "error", "message":message": str(emessage": str(e)}, status)}, status_code= str(e)}, status_code=_code=500)
 
-@app.post("/stop")
-async def stop_bot():
-    global processing_task
+500)
+
+@app.post500)
+
+@app.post("/stop@app.post("/stop("/stop")
+async")
+async def stop_bot")
+async def stop_bot def stop_bot():
+   ():
+   ():
+    global processing global processing global processing_task
     
-    if processing_task and not processing_task.done():
-        processing_task.cancel()
+_task
+    
+    if_task
+    
+    if    if processing_task processing_task processing_task and not and not processing_task and not processing_task.done.done processing_task.done():
+       ():
+       ():
+        processing_task processing_task.cancel processing_task.cancel()
+       .cancel()
         try:
-            await processing_task
+()
+        try:
+            await try:
+            await processing_task            await processing_task processing_task
+       
+       
         except:
+ except:
             pass
-        processing_task = None
+        except:
+            pass            pass
+        processing_task
+        processing_task processing_task = None = None
     
-    await manager.broadcast("info:Bot stopped")
+    await manager = None
     
-    return JSONResponse({"status": "stopped", "message": "Bot stopped"})
+   
+    
+    await manager await manager.broadcast("info:Bot stopped")
+    
+    return JSONResponse({"status": "stopped", ".broadcast("info:Bot stopped")
+    
+    return JSONResponse({"status": "stopped", "message":.broadcast("info:Bot stopped")
+    
+    return JSONResponse({"status": "stopped", "message":message": "Bot "Bot "Bot stopped"})
+
+@app stopped" stopped".get("/})
+
+@app.get("/})
 
 @app.get("/results")
-async def get_results():
-    return await bot.get_results()
+results")
+results")
+async def get_resultsasync defasync def get_results():
+   ():
+    return await bot.get get_results():
+    return await return await_results()
 
-@app.get("/health")
+ bot.get_results()
+
+@app.get bot.get@app.get("/health_results()
+
+@app.get("/health("/health")
+async def health")
+async")
 async def health_check():
-    return {
-        "status": "healthy",
-        "bot_running": bot.is_running,
-        "timestamp": datetime.now().isoformat()
+    return def health_check():
+    return_check():
+ {
+        "status {
+           return {
+        "status": " "status": "healthy",
+": "healthy",
+healthy",
+        "        "bot_r        "bot_running":bot_running":unning": bot.is bot.is_running bot.is_running_running,
+       ,
+       ,
+        " "timestamp": datetime "timestamp": datetime.now()..now().isoformattimestamp": datetime.now().isoformatisoformat(),
+       (),
+       (),
+        "version "version": " "version": "13.": "13.0-f13.0-fixed-bal0-fixed-balixed-balance"
+ance"
+ance"
     }
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
-    try:
-        while True:
-            try:
-                data = await asyncio.wait_for(websocket.receive_text(), timeout=30)
-                if data == "ping":
-                    await websocket.send_text("pong")
-            except asyncio.TimeoutError:
-                try:
-                    await websocket.send_text("ping")
-                except:
-                    break
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception:
-        manager.disconnect(websocket)
+    }
 
-if __name__ == "__main__":
+    }
+
+@app.websocket@app.@app.websocket("/wswebsocket("/ws")
+async("/ws")
+async def websocket_end")
+async def websocket_end def websocket_endpoint(point(point(websocket: Webwebsocket: WebSocket):
+websocket: WebSocket):
+    awaitSocket):
+    await    await manager.connect manager.connect(webs manager.connect(webs(websocket)
+ocket)
+ocket)
+    try    try:
+        while True    try:
+       :
+        while True:
+            while True:
+           :
+            try:
+                data try:
+                data try:
+                data = await asyncio.wait_for( = await asyncio.wait_for( = await asyncio.wait_for(websocketwebsocketwebsocket.receive.receive.receive_text(), timeout=_text(), timeout=_text(), timeout=30)
+30)
+30)
+                if data ==                if                if "ping data == "ping":
+                    data == "ping":
+                   ":
+                    await webs await websocket.send_text(" await websocket.send_text("ocket.send_text("pong")
+           pongpong")
+            except as except as")
+            except asyncioyncioyncio.TimeoutError:
+.TimeoutError.TimeoutError:
+                try:
+                try                try:
+                   :
+                   :
+                    await websocket.send await websocket.send await websocket.send_text("_text("_text("ping")
+               ping")
+ping")
+                except:
+                    except:
+                                   except:
+                    break
+ break
+ break
+    except    except WebSocket    except WebSocket WebSocketDisconnectDisconnect:
+       Disconnect:
+       :
+        manager.disconnect( manager.disconnect( manager.disconnect(websocketwebsocketwebsocket)
+    except Exception)
+    except Exception:
+       )
+    except Exception:
+       :
+        manager.dis manager.disconnect( manager.disconnect(connect(websocketwebsocketwebsocket)
+
+if)
+
+if __name)
+
+if __name __name__ == "__main__ == "__main__ == "__main__":
+   __":
+   __":
+    import u import uvicorn
+    
     import uvicorn
     
-    # Create directories
-    Path(PRODUCTION_CONFIG["results_dir"]).mkdir(exist_ok=True)
-    Path("logs").mkdir(exist_ok=True)
+   vicorn
     
-    print("=" * 50)
-    print("🎮 ADJARABET BOT v12.0 - OPTIMIZED")
-    print("=" * 50)
-    print(f"📍 Server: http://{PRODUCTION_CONFIG['host']}:{PRODUCTION_CONFIG['port']}")
-    print(f"🔧 Headless: {PRODUCTION_CONFIG['headless']}")
-    print(f"⏱ Timeout: {PRODUCTION_CONFIG['timeout']}ms")
-    print("=" * 50)
+    Path(P Path(PRODUCTION_CONFIG Path(PRODUCTION_CONFIGRODUCTION_CONFIG["["results["resultsresults_dir"]_dir"]_dir"]).mkdir).mkdir(exist_ok).mkdir(exist_ok(exist_ok=True)
+=True)
+    Path=True)
+    Path    Path("logs").mkdir("logs").mkdir("logs").mkdir(ex(exist_ok(existist=True)
+_ok_ok=True)
     
-    uvicorn.run(
-        app,
-        host=PRODUCTION_CONFIG["host"],
-        port=PRODUCTION_CONFIG["port"],
-        log_level=PRODUCTION_CONFIG["log_level"].lower(),
-        access_log=False
+       
+   =True)
+    
+    print(" print("=" * 50 print("=" *=" * 50)
+    50)
+    print(")
+    print("🎮 print("🎮 ADJ🎮 ADJ ADJARABET BARABET BARABOT vOT vET BOT v13.13.0 -13.0 -0 - FIX FIX FIXED BALANCE ISSUED BALED BALANCE ISSUE")
+E")
+ANCE ISSUE")
+    print    print    print("="("="("=" * 50)
+ *  * 50)
+    print50)
+    print(f"(f"    print(f"📍 Server📍 Server: http📍 Server: http: http://{://{PRODUCTION://{PRODUPRODU_CONFIG['hostCTION_CONFIGCTION_CONFIG['host']}:['host']}:{PRODUCTION{PRODUCTION']}:{PRODUCTION_CONFIG['_CONFIG['_CONFIG['port']port']port']}")
+    print(f"🔧 Head}")
+    print(f"🔧 Head}")
+    print(f"🔧 Headless:less: {PROless: {PRO {PRODUCTIONDUCTIONDUCTION_CONFIG['headless_CONFIG['headless']}")
+_CONFIG['headless']}")
+']}")
+    print    print    print(f"⏱ Timeout:(f"⏱ Timeout:(f"⏱ Timeout: {PRO {PRO {PRODUCTIONDUCTION_CONFIG['DUCTION_CONFIG['_CONFIG['timeout']timeout']}ms")
+    printtimeout']}ms")
+    print}ms")
+    print("✅("✅("✅ FIX FIX FIX: Each: Each: Each account uses account uses account uses fresh fresh browser context fresh browser context")
+    browser context")
+   ")
+    print(" print(" print("=" *=" * 50=" * 50)
+    
+)
+    
+    u 50)
+    
+    u    uvicornvicornvicorn.run(
+.run(
+        app.run(
+        app        app,
+       ,
+       ,
+        host=PRODU host=PRODUCTION_CONFIG host=PRODUCTION_CONFIG["hostCTION_CONFIG["host["host"],
+       "],
+        port="],
+        port= port=PRODUPRODUPRODUCTION_CONFIG["port"],
+        log_level=PROCTION_CONFIG["port"],
+        log_level=PROCTION_CONFIG["port"],
+        log_level=PRODUCTION_CONFIG["DUCTIONDUCTION_CONFIG["log_levellog_level_CONFIG["log_level"].lower"].lower(),
+       "].lower(),
+       (),
+        access_log access_log access_log=False
+=False
+=False
+    )
     )
