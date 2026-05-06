@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import signal
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -104,7 +103,7 @@ class ConnectionManager:
             except:
                 self.disconnect(connection)
 
-# ================= BOT =================
+# ================= BOT WITH FIXED BALANCE EXTRACTION =================
 class Bot:
     def __init__(self):
         self.log = Logger()
@@ -173,56 +172,191 @@ class Bot:
         
         self.log.info("Cleanup completed")
     
+    async def get_balance_from_page(self, page) -> tuple:
+        """Extract actual balance from page with multiple selectors"""
+        balance_selectors = [
+            '[data-test-id="header-user-balance"]',
+            '.user-balance',
+            '.balance-amount',
+            '[class*="balance"]',
+            '[class*="Balance"]',
+            '.header-balance',
+            '#balance',
+            '.wallet-balance',
+            '.user-wallet-balance'
+        ]
+        
+        # Try each selector
+        for selector in balance_selectors:
+            try:
+                element = await page.wait_for_selector(selector, timeout=2000)
+                if element:
+                    text = await element.inner_text()
+                    if text and text.strip() and text != '0' and text != '0.00':
+                        # Clean the text
+                        cleaned = re.sub(r'[^\d,.]', '', text)
+                        if cleaned:
+                            return cleaned, text
+            except:
+                continue
+        
+        # Try to find any element with AMD or ֏ symbol
+        try:
+            # Look for any element containing balance
+            elements = await page.query_selector_all('[class*="balance"], [class*="Balance"], [class*="money"], [class*="amount"]')
+            for element in elements:
+                text = await element.inner_text()
+                if '֏' in text or 'AMD' in text or 'dram' in text.lower():
+                    cleaned = re.sub(r'[^\d,.]', '', text)
+                    if cleaned and cleaned != '0':
+                        return cleaned, text
+        except:
+            pass
+        
+        # Try to get from page content as last resort
+        try:
+            content = await page.content()
+            # Look for balance pattern in HTML
+            patterns = [
+                r'balance["\']?\s*[:=]\s*["\']?([\d,]+\.?\d*)',
+                r'amount["\']?\s*[:=]\s*["\']?([\d,]+\.?\d*)',
+                r'([\d,]+\.?\d*)\s*֏',
+                r'([\d,]+\.?\d*)\s*AMD'
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, content, re.IGNORECASE)
+                if match:
+                    return match.group(1), match.group(1)
+        except:
+            pass
+        
+        return None, None
+    
     async def login_account(self, account: Account) -> Account:
-        """Login single account"""
+        """Login single account with proper balance extraction"""
         page = None
         
         try:
             page = await self.context.new_page()
             page.set_default_timeout(PRODUCTION_CONFIG["timeout"])
             
-            await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-            await asyncio.sleep(0.5)
+            # Navigate to login page
+            self.log.debug(f"Navigating for {account.username}")
+            await page.goto('https://www.adjarabet.am/hy', wait_until='networkidle', timeout=30000)
+            await asyncio.sleep(1)
             
-            # Check if already logged in
-            try:
-                balance_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=3000)
-                if balance_el:
-                    balance_text = await balance_el.inner_text()
-                    account.balance = balance_text
-                    account.balance_value = self._parse_balance(balance_text)
-                    account.status = AccountStatus.SUCCESS
-                    self.log.info(f"✅ {account.username} | {balance_text}")
-                    return account
-            except:
-                pass
+            # Check if already logged in via cookies
+            balance, balance_raw = await self.get_balance_from_page(page)
+            if balance and float(balance.replace(',', '')) > 0:
+                account.balance = balance_raw or balance
+                account.balance_value = self._parse_balance(balance)
+                account.status = AccountStatus.SUCCESS
+                self.log.info(f"✅ {account.username} | Balance: {account.balance} ֏")
+                return account
             
-            # Login form
+            # Find login button
+            login_selectors = [
+                '[data-test-id="header-login-button"]',
+                'button:has-text("Login")',
+                'button:has-text("Մուտք")',
+                '.login-btn',
+                '.signin-btn',
+                'a:has-text("Login")',
+                'a:has-text("Մուտք")'
+            ]
+            
+            login_clicked = False
+            for selector in login_selectors:
+                try:
+                    login_btn = await page.wait_for_selector(selector, timeout=3000)
+                    if login_btn:
+                        await login_btn.click()
+                        login_clicked = True
+                        break
+                except:
+                    continue
+            
+            if not login_clicked:
+                # Try direct navigation to login page
+                await page.goto('https://www.adjarabet.am/hy/login', wait_until='networkidle', timeout=15000)
+                await asyncio.sleep(1)
+            
+            # Wait for login form
             try:
                 await page.wait_for_selector('input[name="userIdentifier"]', timeout=10000)
-                await page.fill('input[name="userIdentifier"]', account.username)
-                await asyncio.sleep(0.3)
-                await page.fill('input[type="password"]', account.password)
-                await asyncio.sleep(0.3)
-                await page.click('[data-test-id="header-login-button"]')
-                
-                # Wait for balance
-                balance_el = await page.wait_for_selector(
-                    '[data-test-id="header-user-balance"]', 
-                    timeout=15000
-                )
-                
-                balance_text = await balance_el.inner_text()
-                account.balance = balance_text
-                account.balance_value = self._parse_balance(balance_text)
-                account.status = AccountStatus.SUCCESS
-                self.log.info(f"✅ {account.username} | {balance_text}")
-                
             except PlaywrightTimeout:
                 account.status = AccountStatus.TIMEOUT
-                account.error = "Login timeout"
-                self.log.warning(f"⏰ {account.username} - Timeout")
+                account.error = "Login form not found"
+                self.log.warning(f"⏰ {account.username} - Login form not found")
+                return account
             
+            # Fill username
+            await page.fill('input[name="userIdentifier"]', account.username)
+            await asyncio.sleep(0.5)
+            
+            # Fill password
+            await page.fill('input[type="password"]', account.password)
+            await asyncio.sleep(0.5)
+            
+            # Click submit button
+            submit_selectors = [
+                'button[type="submit"]',
+                'input[type="submit"]',
+                'button:has-text("Login")',
+                'button:has-text("Մուտք")'
+            ]
+            
+            submitted = False
+            for selector in submit_selectors:
+                try:
+                    submit_btn = await page.query_selector(selector)
+                    if submit_btn:
+                        await submit_btn.click()
+                        submitted = True
+                        break
+                except:
+                    continue
+            
+            if not submitted:
+                await page.keyboard.press('Enter')
+            
+            # Wait for navigation and balance
+            await asyncio.sleep(2)
+            
+            # Try to get balance after login
+            for attempt in range(5):
+                await asyncio.sleep(1)
+                balance, balance_raw = await self.get_balance_from_page(page)
+                if balance and float(balance.replace(',', '')) > 0:
+                    account.balance = balance_raw or balance
+                    account.balance_value = self._parse_balance(balance)
+                    account.status = AccountStatus.SUCCESS
+                    self.log.info(f"✅ {account.username} | Balance: {account.balance} ֏")
+                    return account
+            
+            # Check for login error
+            error_selectors = [
+                '.error-message',
+                '.alert-danger',
+                '[class*="error"]',
+                'div:has-text("Invalid")',
+                'div:has-text("Սխալ")'
+            ]
+            
+            for selector in error_selectors:
+                try:
+                    error_elem = await page.query_selector(selector)
+                    if error_elem:
+                        error_text = await error_elem.inner_text()
+                        if error_text and ('Invalid' in error_text or 'Սխալ' in error_text):
+                            account.error = error_text[:100]
+                            break
+                except:
+                    continue
+            
+            account.status = AccountStatus.FAILED
+            account.error = account.error or "Balance not found after login"
+            self.log.warning(f"❌ {account.username} - {account.error}")
             return account
             
         except Exception as e:
@@ -239,13 +373,21 @@ class Bot:
                     pass
     
     def _parse_balance(self, text: str) -> float:
+        """Parse balance text to float"""
+        if not text:
+            return 0.0
         try:
-            match = re.search(r'([\d,]+\.?\d*)', text.replace(',', ''))
-            if match:
-                return float(match.group(1))
+            # Remove all non-numeric characters except comma and dot
+            cleaned = re.sub(r'[^\d,.]', '', text)
+            # Replace comma with dot if needed
+            if ',' in cleaned and '.' not in cleaned:
+                cleaned = cleaned.replace(',', '.')
+            elif ',' in cleaned and '.' in cleaned:
+                # Handle cases like "1,234.56"
+                cleaned = cleaned.replace(',', '')
+            return float(cleaned)
         except:
-            pass
-        return 0.0
+            return 0.0
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager):
         """Process all accounts"""
@@ -261,6 +403,8 @@ class Bot:
             if not self.is_running:
                 break
             
+            self.log.info(f"[{i}/{self.total_accounts}] Checking {account.username}...")
+            
             result = await self.login_account(account)
             self.results.append(result)
             self.processed = i
@@ -272,6 +416,7 @@ class Bot:
             await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
             await manager.broadcast(f"PROGRESS:{i}/{self.total_accounts}")
             
+            # Small delay between accounts
             await asyncio.sleep(0.5)
         
         # Send summary
@@ -283,6 +428,11 @@ class Bot:
         
         duration = (datetime.now() - start_time).total_seconds()
         self.log.info(f"Completed: {successful}/{self.total_accounts} ({rate:.1f}%) in {duration:.1f}s")
+        
+        # Log balances summary
+        balances = [r.balance_value for r in self.results if r.status == AccountStatus.SUCCESS]
+        if balances:
+            self.log.info(f"Balance stats - Min: {min(balances):.2f}, Max: {max(balances):.2f}, Avg: {sum(balances)/len(balances):.2f}")
     
     async def _save_results(self):
         try:
@@ -315,7 +465,7 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-# HTML UI (your provided UI)
+# HTML UI (FULL UI with your design)
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
@@ -456,6 +606,7 @@ HTML_UI = '''<!DOCTYPE html>
         .copy-btn.copied { color: #3fb950; }
         .balance-positive { color: #3fb950; font-weight: bold; }
         .balance-zero { color: #f85149; }
+        .balance-normal { color: #e4e6eb; }
         .sort-indicator { margin-left: 5px; font-size: 10px; }
         .toast { position: fixed; bottom: 30px; right: 30px; background: linear-gradient(135deg, #21262d, #161b22); border-left: 4px solid #58a6ff; padding: 14px 24px; border-radius: 12px; animation: slideInRight 0.3s ease; z-index: 1000; }
         @keyframes slideInRight { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
@@ -610,7 +761,7 @@ HTML_UI = '''<!DOCTYPE html>
                         addOrUpdateResult(result);
                         if (!loggedUsernames.has(result.username)) {
                             loggedUsernames.add(result.username);
-                            addTerminalLine(`${result.status} ${result.username} | ${result.balance || '0'}`, 
+                            addTerminalLine(`${result.status} ${result.username} | Balance: ${result.balance || '0'} ֏`, 
                                 result.status === '✅' ? 'success' : result.status === '❌' ? 'error' : 'warning');
                         }
                     } catch(e) {}
@@ -653,6 +804,13 @@ HTML_UI = '''<!DOCTYPE html>
             return match ? parseFloat(match[0].replace(/,/g, '')) : 0;
         }
 
+        function getBalanceClass(balance) {
+            const value = parseBalance(balance);
+            if (value > 1000) return 'balance-positive';
+            if (value > 0) return 'balance-normal';
+            return 'balance-zero';
+        }
+
         function sortResults(results) {
             return [...results].sort((a, b) => {
                 let aVal, bVal;
@@ -683,12 +841,12 @@ HTML_UI = '''<!DOCTYPE html>
             if (sorted.length === 0) tbody.innerHTML = '<tr><td colspan="5" style="text-align: center; color: #8b949e; padding: 40px;">No results found</td></tr>';
             else {
                 tbody.innerHTML = sorted.map(acc => {
-                    const balanceValue = parseBalance(acc.balance);
+                    const balanceClass = getBalanceClass(acc.balance);
                     return `<tr>
                         <td style="font-size: 20px;">${acc.status || '-'}</td>
                         <td><div style="display: flex; align-items: center; justify-content: space-between;"><strong style="color: #58a6ff;">${escapeHtml(acc.username || '')}</strong><button class="copy-btn" onclick="copyText('${escapeHtml(acc.username || '')}', this)"><i class="fas fa-copy"></i></button></div></td>
                         <td><div style="display: flex; align-items: center; justify-content: space-between;"><span style="font-family: monospace;">${escapeHtml(acc.password || '')}</span><button class="copy-btn" onclick="copyText('${escapeHtml(acc.password || '')}', this)"><i class="fas fa-copy"></i></button></div></td>
-                        <td class="${balanceValue > 0 ? 'balance-positive' : 'balance-zero'}">${acc.balance || '0'}</td>
+                        <td class="${balanceClass}">${acc.balance || '0'} ֏</td>
                         <td style="color: #8b949e; font-size: 12px;">${acc.error || '-'}</td>
                     </tr>`;
                 }).join('');
@@ -802,7 +960,6 @@ HTML_UI = '''<!DOCTYPE html>
             localStorage.removeItem('bot_accounts');
             updateAccountsCount();
             addTerminalLine('🗑 All accounts cleared', 'info');
-            try { await fetch('/accounts', { method: 'DELETE' }); } catch(e) {}
         }
 
         async function loadResults() {
@@ -869,7 +1026,6 @@ HTML_UI = '''<!DOCTYPE html>
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
     logger = Logger()
     logger.info("=" * 50)
     logger.info("ADJARABET BOT v12.0 - OPTIMIZED")
@@ -879,7 +1035,6 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown
     logger.info("Shutting down...")
     if processing_task and not processing_task.done():
         processing_task.cancel()
@@ -916,7 +1071,6 @@ async def start_bot(request: Request):
         if not content.strip():
             return JSONResponse({"status": "error", "message": "No accounts provided"}, status_code=400)
         
-        # Parse accounts
         accounts = []
         for line in content.splitlines():
             line = line.strip()
@@ -930,7 +1084,6 @@ async def start_bot(request: Request):
         if not accounts:
             return JSONResponse({"status": "error", "message": "No valid accounts found"}, status_code=400)
         
-        # Stop existing task
         if processing_task and not processing_task.done():
             processing_task.cancel()
             try:
@@ -938,7 +1091,6 @@ async def start_bot(request: Request):
             except:
                 pass
         
-        # Start new processing
         async def run():
             try:
                 await manager.broadcast("STATUS:started")
