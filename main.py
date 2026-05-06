@@ -3,19 +3,18 @@ import json
 import logging
 import os
 import re
-import signal
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 from contextlib import asynccontextmanager
 
 import aiofiles
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # =========================================================
@@ -134,7 +133,9 @@ class AdjarabetBot:
 
         self.results: List[Account] = []
 
-        self.semaphore = asyncio.Semaphore(Config.CONCURRENT_BROWSERS)
+        self.semaphore = asyncio.Semaphore(
+            Config.CONCURRENT_BROWSERS
+        )
 
         self.stats = {
             "processed": 0,
@@ -197,7 +198,12 @@ class AdjarabetBot:
         try:
             path = Config.RESULTS_DIR / "results.json"
 
-            async with aiofiles.open(path, "w", encoding="utf-8") as f:
+            async with aiofiles.open(
+                path,
+                "w",
+                encoding="utf-8"
+            ) as f:
+
                 await f.write(
                     json.dumps(
                         [asdict(x) for x in self.results],
@@ -216,7 +222,11 @@ class AdjarabetBot:
     def parse_balance(self, text: str) -> float:
         try:
             cleaned = text.replace(",", "")
-            match = re.search(r"(\d+\.?\d*)", cleaned)
+
+            match = re.search(
+                r"(\d+\.?\d*)",
+                cleaned
+            )
 
             if match:
                 return float(match.group(1))
@@ -227,10 +237,11 @@ class AdjarabetBot:
         return 0.0
 
     # =====================================================
-    # LOGIN ACCOUNT
+    # LOGIN
     # =====================================================
 
     async def login(self, account: Account):
+
         async with self.semaphore:
 
             for attempt in range(Config.MAX_RETRIES):
@@ -238,37 +249,23 @@ class AdjarabetBot:
                 if not self.running:
                     return
 
-                context = Nimport asyncio
-import json
-import logging
-import os
-import re
-import signal
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from enum import Enum
-from pathlib import Path
-from typing import List, Optional
-from contextlib import asynccontextmanager
-
-import aiofiles
-import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-one
+                context = None
                 page = None
 
                 try:
                     context = await self.browser.new_context(
-                        viewport={"width": 1280, "height": 720},
+                        viewport={
+                            "width": 1280,
+                            "height": 720
+                        },
                         ignore_https_errors=True
                     )
 
                     page = await context.new_page()
 
-                    page.set_default_timeout(Config.TIMEOUT)
+                    page.set_default_timeout(
+                        Config.TIMEOUT
+                    )
 
                     await page.goto(
                         "https://www.adjarabet.am/hy",
@@ -294,33 +291,28 @@ one
                         '[data-test-id="header-login-button"]'
                     )
 
-                    try:
-                        await page.wait_for_selector(
-                            '[data-test-id="header-user-balance"]',
-                            timeout=15000
-                        )
+                    await page.wait_for_selector(
+                        '[data-test-id="header-user-balance"]',
+                        timeout=15000
+                    )
 
-                        balance_el = await page.query_selector(
-                            '[data-test-id="header-user-balance"]'
-                        )
+                    balance_el = await page.query_selector(
+                        '[data-test-id="header-user-balance"]'
+                    )
 
-                        balance = await balance_el.inner_text()
+                    balance = await balance_el.inner_text()
 
-                        account.balance = balance
-                        account.balance_value = self.parse_balance(balance)
-                        account.status = AccountStatus.SUCCESS.value
+                    account.balance = balance
+                    account.balance_value = self.parse_balance(balance)
+                    account.status = AccountStatus.SUCCESS.value
 
-                        self.stats["success"] += 1
+                    self.stats["success"] += 1
 
-                        logger.info(f"SUCCESS {account.username}")
+                    logger.info(
+                        f"SUCCESS {account.username}"
+                    )
 
-                        break
-
-                    except:
-                        account.status = AccountStatus.FAILED.value
-                        account.error = "Login failed"
-
-                        self.stats["failed"] += 1
+                    break
 
                 except PlaywrightTimeout:
                     account.status = AccountStatus.TIMEOUT.value
@@ -328,13 +320,19 @@ one
 
                     self.stats["timeout"] += 1
 
-                    logger.warning(f"TIMEOUT {account.username}")
+                    logger.warning(
+                        f"TIMEOUT {account.username}"
+                    )
 
                 except Exception as e:
                     account.status = AccountStatus.FAILED.value
                     account.error = str(e)[:120]
 
-                    logger.error(f"ERROR {account.username} | {e}")
+                    self.stats["failed"] += 1
+
+                    logger.error(
+                        f"ERROR {account.username} | {e}"
+                    )
 
                 finally:
                     try:
@@ -356,7 +354,10 @@ one
             await self.save_results()
 
             await manager.broadcast(
-                "RESULT:" + json.dumps(asdict(account), ensure_ascii=False)
+                "RESULT:" + json.dumps(
+                    asdict(account),
+                    ensure_ascii=False
+                )
             )
 
             await manager.broadcast(
@@ -381,9 +382,16 @@ one
         tasks = []
 
         for acc in accounts:
-            tasks.append(asyncio.create_task(self.login(acc)))
+            tasks.append(
+                asyncio.create_task(
+                    self.login(acc)
+                )
+            )
 
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *tasks,
+            return_exceptions=True
+        )
 
         logger.info("Finished")
 
@@ -398,7 +406,9 @@ bot = AdjarabetBot()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.start()
+
     yield
+
     await bot.stop()
 
 
@@ -408,7 +418,6 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -416,7 +425,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 # =========================================================
 # HTML
@@ -426,26 +434,33 @@ HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<title>Bot</title>
+<title>Adjarabet Bot</title>
+
 <style>
+
 body{
 background:#0d1117;
 color:white;
 font-family:Arial;
 padding:20px;
 }
+
 textarea{
 width:100%;
 height:250px;
 background:#161b22;
 color:white;
 padding:10px;
+border:none;
+outline:none;
 }
+
 button{
 padding:10px 20px;
 margin-top:10px;
 cursor:pointer;
 }
+
 #logs{
 margin-top:20px;
 height:300px;
@@ -453,9 +468,12 @@ overflow:auto;
 background:#161b22;
 padding:10px;
 }
+
 </style>
 </head>
+
 <body>
+
 <h1>Adjarabet Bot v13</h1>
 
 <textarea id="accounts"></textarea>
@@ -471,9 +489,13 @@ padding:10px;
 let ws = new WebSocket(`ws://${location.host}/ws`)
 
 ws.onmessage = (e)=>{
+
 let logs = document.getElementById('logs')
+
 logs.innerHTML += `<div>${e.data}</div>`
+
 logs.scrollTop = logs.scrollHeight
+
 }
 
 async function startBot(){
@@ -488,10 +510,10 @@ body:data
 }
 
 </script>
+
 </body>
 </html>
 """
-
 
 # =========================================================
 # ROUTES
@@ -507,6 +529,7 @@ async def home():
 
 @app.post("/start")
 async def start(request: Request):
+
     global current_task
 
     body = await request.body()
@@ -522,10 +545,10 @@ async def start(request: Request):
         if not line:
             continue
 
-        if ':' not in line:
+        if ":" not in line:
             continue
 
-        username, password = line.split(':', 1)
+        username, password = line.split(":", 1)
 
         accounts.append(
             Account(
@@ -537,7 +560,9 @@ async def start(request: Request):
     if current_task and not current_task.done():
         current_task.cancel()
 
-    current_task = asyncio.create_task(bot.process(accounts))
+    current_task = asyncio.create_task(
+        bot.process(accounts)
+    )
 
     return {
         "status": "started",
@@ -576,6 +601,3 @@ if __name__ == "__main__":
         log_level="warning",
         access_log=False
     )
-```
-
----
