@@ -371,7 +371,6 @@ document.getElementById('accounts').value=localStorage.getItem('accounts')||'';
 document.getElementById('accounts').addEventListener('input',()=>localStorage.setItem('accounts',document.getElementById('accounts').value));
 document.getElementById('search').addEventListener('input',()=>renderResults());
 connect();
-setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(d.length>results.length){results=d;renderResults();updateStats();}}catch(e){}},3000);
 </script>
 </body>
 </html>'''
