@@ -707,7 +707,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
-
 if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
