@@ -28,9 +28,6 @@ CONFIG = {
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.5)),
-    "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
-    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
-    "send_to_telegram": os.getenv("SEND_TO_TELEGRAM", "false").lower() == "true",
 }
 
 logging.basicConfig(
@@ -709,54 +706,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
-
-
-
-import httpx
-
-async def send_to_telegram(message: str):
-    if not CONFIG.get("send_to_telegram"):
-        return
-
-    token = CONFIG.get("telegram_token")
-    chat_id = CONFIG.get("telegram_chat_id")
-
-    if not token or not chat_id:
-        logger.warning("Telegram credentials not configured")
-        return
-
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(url, json={
-                "chat_id": chat_id,
-                "text": message,
-                "parse_mode": "HTML"
-            })
-    except Exception as e:
-        logger.error(f"Telegram send error: {e}")
-
-
-def format_account_message(account):
-    try:
-        ts = getattr(account, "timestamp", "")[:19]
-        err = getattr(account, "error", "N/A")[:50]
-
-        if account.status == AccountStatus.SUCCESS:
-            return f"""
-🔐 Ակաունտ
-👤 {account.username}
-💰 {account.balance}
-📅 {ts}
-"""
-        return f"""
-❌ {account.username}
-Error: {err}
-📅 {ts}
-"""
-    except Exception:
-        return "Format error"
-
 
 
 if __name__ == "__main__":
