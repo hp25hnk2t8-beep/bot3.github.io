@@ -11,7 +11,7 @@ from typing import List, Dict, Any, Optional
 from collections import deque
 import time
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect  # ← Request-ը պետք է լինի
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
@@ -20,11 +20,11 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 CONFIG = {
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
-    "headless": True,  # Always headless
+    "headless": True,
     "timeout_navigation": 10000,
     "timeout_element": 5000,
-    "max_retries": 1,  # No retries, faster
-    "concurrent_limit": 1,  # Single browser context
+    "max_retries": 1,
+    "concurrent_limit": 1,
     "delay_between_accounts": 0.5,
 }
 
@@ -78,7 +78,7 @@ class ConnectionManager:
             except:
                 self.disconnect(conn)
 
-# ================= SIMPLE BOT (NO CONTEXT PER ACCOUNT) =================
+# ================= SIMPLE BOT =================
 class SimpleBot:
     def __init__(self):
         self.playwright = None
@@ -89,7 +89,6 @@ class SimpleBot:
         self.results: List[Account] = []
         
     async def initialize(self):
-        """Initialize browser once, reuse for all accounts"""
         try:
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.launch(
@@ -109,7 +108,6 @@ class SimpleBot:
             return False
     
     def parse_balance(self, text: str) -> str:
-        """Quick balance parse"""
         try:
             match = re.search(r'(\d+(?:[.,]\d+)?)', text.replace(',', ''))
             if match:
@@ -120,14 +118,11 @@ class SimpleBot:
         return "0 ₾"
     
     async def login_single(self, account: Account) -> Account:
-        """Login using single page (no new context each time)"""
         try:
-            # Clear cookies/storage for fresh state
             await self.context.clear_cookies()
             await self.page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded', timeout=10000)
             await asyncio.sleep(0.3)
             
-            # Check if already logged in
             try:
                 balance_el = await self.page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2000)
                 if balance_el:
@@ -139,12 +134,10 @@ class SimpleBot:
             except:
                 pass
             
-            # Fast login
             await self.page.fill('input[name="userIdentifier"]', account.username)
             await self.page.fill('input[type="password"]', account.password)
             await self.page.click('[data-test-id="header-login-button"]')
             
-            # Wait for balance
             try:
                 balance_el = await self.page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=8000)
                 balance_text = await balance_el.inner_text()
@@ -152,7 +145,6 @@ class SimpleBot:
                 account.status = AccountStatus.SUCCESS
                 logger.info(f"✅ {account.username} | {account.balance}")
             except:
-                # Check for error
                 try:
                     error_el = await self.page.wait_for_selector('[class*="error"]', timeout=1000)
                     if error_el:
@@ -169,7 +161,6 @@ class SimpleBot:
         return account
     
     async def process_accounts(self, accounts: List[Account], manager: ConnectionManager):
-        """Process accounts one by one"""
         self.results = []
         total = len(accounts)
         
@@ -183,17 +174,13 @@ class SimpleBot:
             result = await self.login_single(account)
             self.results.append(result)
             
-            # Broadcast
             await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
             await manager.broadcast(f"PROGRESS:{i+1}/{total}")
             
-            # Small delay
             await asyncio.sleep(CONFIG["delay_between_accounts"])
         
-        # Save results
         self.save_results()
         
-        # Summary
         success = sum(1 for r in self.results if r.status == AccountStatus.SUCCESS)
         logger.info(f"Done: ✅{success} ❌{total-success}")
         await manager.broadcast(f"SUMMARY:{success}/{total}")
@@ -231,7 +218,7 @@ manager = ConnectionManager()
 bot = SimpleBot()
 processing_task: Optional[asyncio.Task] = None
 
-# Minimal HTML UI
+# HTML UI (կրճատված տարբերակ)
 HTML_UI = '''<!DOCTYPE html>
 <html>
 <head>
@@ -240,7 +227,7 @@ HTML_UI = '''<!DOCTYPE html>
     <title>Adjarabet Bot</title>
     <style>
         * { margin:0; padding:0; box-sizing:border-box; }
-        body { background:#0a0c10; color:#e6edf3; font-family:system-ui,-apple-system,sans-serif; padding:15px; }
+        body { background:#0a0c10; color:#e6edf3; font-family:system-ui,sans-serif; padding:15px; }
         .container { max-width:1200px; margin:0 auto; }
         .header { background:#161b22; border-radius:12px; padding:15px 20px; margin-bottom:20px; border:1px solid #30363d; }
         .stats { display:flex; gap:12px; margin-bottom:20px; flex-wrap:wrap; }
@@ -390,7 +377,7 @@ setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(
 </html>'''
 
 # ================= API ENDPOINTS =================
-app = FastAPI(lifespan=None)
+app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
@@ -399,6 +386,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    global processing_task
     if processing_task and not processing_task.done():
         processing_task.cancel()
     await bot.cleanup()
@@ -408,7 +396,7 @@ async def root():
     return HTMLResponse(HTML_UI)
 
 @app.post("/start")
-async def start_bot(request: Request):
+async def start_bot(request: Request):  # ← հիմա Request-ը սահմանված է
     global processing_task
     
     body = (await request.body()).decode()
@@ -431,15 +419,16 @@ async def start_bot(request: Request):
         except:
             pass
     
+    bot.is_running = True
     processing_task = asyncio.create_task(bot.process_accounts(accounts, manager))
     return {"status": "started", "total": len(accounts)}
 
 @app.post("/stop")
 async def stop_bot():
     global processing_task
+    bot.is_running = False
     if processing_task and not processing_task.done():
         processing_task.cancel()
-    bot.is_running = False
     await manager.broadcast("STATUS:stopped")
     return {"status": "stopped"}
 
@@ -449,7 +438,7 @@ async def get_results():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "processed": len(bot.results)}
+    return {"status": "ok", "processed": len(bot.results), "running": bot.is_running}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
