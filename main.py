@@ -23,11 +23,11 @@ CONFIG = {
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
     "headless": os.getenv("HEADLESS", "true").lower() == "true",
-    "timeout_nav": int(os.getenv("TIMEOUT_NAV", 8500)),
-    "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 4500)),
+    "timeout_nav": int(os.getenv("TIMEOUT_NAV", 9000)),
+    "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
-    "delay_between": float(os.getenv("DELAY_BETWEEN", 0.4)),
+    "delay_between": float(os.getenv("DELAY_BETWEEN", 0.5)),
 }
 
 logging.basicConfig(
