@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""
-Run the bot server directly without uvicorn reload
-"""
-import uvicorn
+import asyncio
+import sys
+from pathlib import Path
+
+# Add current directory to path
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Import the main app creator
+from main import create_app, bot, manager
 
 if __name__ == "__main__":
+    import uvicorn
+    
     print("=" * 60)
     print("🤖 Adjarabet Bot Server Starting...")
     print("=" * 60)
@@ -12,10 +19,13 @@ if __name__ == "__main__":
     print("📍 Press CTRL+C to stop")
     print("=" * 60)
     
+    # Create app
+    app = create_app()
+    
+    # Run server
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
         port=8000,
-        reload=False,  # Important! Don't use reload with Playwright
         log_level="info"
     )
