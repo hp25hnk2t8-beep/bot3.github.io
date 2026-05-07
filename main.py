@@ -28,6 +28,9 @@ CONFIG = {
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.5)),
+    "telegram_token": os.getenv("TELEGRAM_TOKEN", ""),
+    "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "send_to_telegram": os.getenv("SEND_TO_TELEGRAM", "false").lower() == "true",
 }
 
 logging.basicConfig(
@@ -707,12 +710,6 @@ async def websocket_endpoint(websocket: WebSocket):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
-CONFIG = {
-    # ... մնացած կարգավորումները ...
-    "telegram_token": os.getenv("8617801891:AAEJh_HEUb2LaFZ42bGaEdaMW_XBvIHvP1k", ""),  # Ձեր բոտի token-ը
-    "telegram_chat_id": os.getenv("5215854157", ""),  # Ձեր chat ID-ն
-    "send_to_telegram": os.getenv("SEND_TO_TELEGRAM", "false").lower() == "true",
-}
 
 
 import httpx
