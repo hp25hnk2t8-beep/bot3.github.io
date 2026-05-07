@@ -26,7 +26,7 @@ CONFIG = {
     "timeout_nav": int(os.getenv("TIMEOUT_NAV", 8000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 4000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 12)),
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 7)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
 }
 
