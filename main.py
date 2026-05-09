@@ -4,20 +4,65 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 from collections import deque
 import time
+import secrets
 
 import aiofiles
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+from dotenv import load_dotenv
+load_dotenv()
 
+# ================= AUTH CONFIG =================
+AUTH_USERNAME = os.getenv("BOT_USERNAME")
+AUTH_PASSWORD = os.getenv("BOT_PASSWORD")
+
+security = HTTPBasic()
+
+def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, AUTH_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, AUTH_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+# ================= TOKEN MANAGER FOR WEBSOCKET =================
+class TokenManager:
+    def __init__(self):
+        self.tokens: Dict[str, datetime] = {}
+    
+    def create_token(self) -> str:
+        token = secrets.token_urlsafe(32)
+        self.tokens[token] = datetime.now() + timedelta(minutes=5)
+        return token
+    
+    def verify_token(self, token: str) -> bool:
+        if token not in self.tokens:
+            return False
+        if self.tokens[token] < datetime.now():
+            del self.tokens[token]
+            return False
+        return True
+    
+    def remove_token(self, token: str):
+        self.tokens.pop(token, None)
+
+token_manager = TokenManager()
+
+# ================= CONFIG =================
 CONFIG = {
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
@@ -25,7 +70,7 @@ CONFIG = {
     "timeout_nav": int(os.getenv("TIMEOUT_NAV", 15000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),  # REAL concurrent tabs!
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
 }
 
@@ -108,7 +153,7 @@ class Bot:
         self.results: List[Account] = []
         self.all_accounts: List[Account] = []
         self.current_index = 0
-        self.semaphore = None  # Will be initialized after browser is ready
+        self.semaphore = None
         self.rate_limiter = RateLimiter()
         self._running = False
         self._stop_flag = False
@@ -159,7 +204,6 @@ class Bot:
         return "0 ֏", 0.0
 
     async def _login_one(self, acc: Account, worker_id: int) -> Account:
-        """Process single account with its own context - REAL concurrent!"""
         ctx = None
         page = None
         try:
@@ -167,7 +211,6 @@ class Bot:
             
             logger.info(f"[Worker {worker_id}] 🔄 Processing: {acc.username}")
             
-            # Each account gets its OWN independent context (REAL tab!)
             ctx = await self.browser.new_context(
                 viewport={'width': 1280, 'height': 720},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -180,11 +223,9 @@ class Bot:
                 if not self._running or self._stop_flag:
                     return acc
                 try:
-                    # Go to login page
                     await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
                     await asyncio.sleep(0.5)
                     
-                    # Check if already logged in
                     try:
                         bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2000)
                         if bal_el:
@@ -196,12 +237,10 @@ class Bot:
                     except:
                         pass
                     
-                    # Fill login form
                     await page.fill('input[name="userIdentifier"]', acc.username, timeout=CONFIG["timeout_element"])
                     await page.fill('input[type="password"]', acc.password, timeout=CONFIG["timeout_element"])
                     await page.click('[data-test-id="header-login-button"]')
                     
-                    # Wait for balance to appear
                     bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=CONFIG["timeout_nav"])
                     txt = await bal_el.inner_text()
                     acc.balance, acc.balance_value = self._parse_balance(txt)
@@ -245,7 +284,6 @@ class Bot:
                     pass
 
     async def _worker(self, acc: Account, worker_id: int, manager: ConnectionManager):
-        """Worker for single account - runs in semaphore for concurrency control"""
         async with self.semaphore:
             if self._stop_flag:
                 return acc
@@ -257,8 +295,6 @@ class Bot:
             return result
 
     async def start(self, accounts: List[Account], manager: ConnectionManager):
-        """Start or resume processing with REAL concurrent tabs"""
-        # Check if we're resuming
         if self.all_accounts and self.current_index > 0 and self.current_index < len(self.all_accounts):
             logger.info(f"▶ RESUMING from account {self.current_index + 1}/{len(self.all_accounts)}")
             await manager.broadcast(f"STATUS:resuming from {self.current_index + 1}")
@@ -276,7 +312,6 @@ class Bot:
         
         await manager.broadcast(f"PROGRESS:{self.current_index}/{total}")
 
-        # Get remaining accounts
         remaining_accounts = self.all_accounts[self.current_index:]
         
         if not remaining_accounts:
@@ -285,10 +320,8 @@ class Bot:
             self._running = False
             return
         
-        # Process accounts with REAL concurrency!
         logger.info(f"🚀 Starting concurrent processing with {CONFIG['concurrent_limit']} tabs")
         
-        # Create tasks for all remaining accounts (semaphore will limit concurrency)
         tasks = []
         for i, acc in enumerate(remaining_accounts):
             if self._stop_flag:
@@ -296,11 +329,8 @@ class Bot:
             worker_id = (self.current_index + i) % CONFIG["concurrent_limit"]
             task = asyncio.create_task(self._worker(acc, worker_id, manager))
             tasks.append(task)
-            
-            # Small delay between starting tasks to avoid rate limiting
             await asyncio.sleep(CONFIG["delay_between"])
         
-        # Wait for all tasks to complete
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -320,13 +350,10 @@ class Bot:
         self._running = False
 
     async def stop(self):
-        """Stop current processing"""
         self._stop_flag = True
-        await manager.broadcast("STATUS:stopped")
         logger.info(f"⏹ Stopped at account {self.current_index}/{len(self.all_accounts)}")
 
     async def reset(self):
-        """Reset everything - fresh start on next run"""
         self.all_accounts = []
         self.results = []
         self.current_index = 0
@@ -336,7 +363,6 @@ class Bot:
         logger.info("🔄 Bot reset - fresh start ready")
 
     async def clear_results(self):
-        """Clear only results table, keep accounts"""
         self.results = []
         self.current_index = 0
         Path("results/results.json").unlink(missing_ok=True)
@@ -369,7 +395,7 @@ processing_task: Optional[asyncio.Task] = None
 
 async def retry_single_account(acc: Account):
     try:
-        result = await bot._login_one(acc, 99)  # worker_id=99 for retry
+        result = await bot._login_one(acc, 99)
         
         existing_index = None
         for i, r in enumerate(bot.results):
@@ -407,22 +433,27 @@ HTML_UI = '''<!DOCTYPE html>
         * { margin:0; padding:0; box-sizing:border-box; }
         body { background: linear-gradient(135deg, #0a0c10 0%, #0d1117 100%); color: #e6edf3; font-family: 'Inter', sans-serif; padding: 20px; min-height: 100vh; }
         .container { max-width: 1600px; margin: 0 auto; }
+        .login-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.9); backdrop-filter: blur(12px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+        .login-box { background: #161b22; border: 1px solid #30363d; border-radius: 24px; padding: 40px; width: 320px; text-align: center; box-shadow: 0 0 30px rgba(0,0,0,0.5); }
+        .login-box h2 { margin-bottom: 24px; background: linear-gradient(135deg, #58a6ff, #3fb950); -webkit-background-clip: text; background-clip: text; color: transparent; }
+        .login-box input { width: 100%; padding: 12px; margin: 8px 0; background: #0d1117; border: 1px solid #30363d; border-radius: 12px; color: white; font-size: 14px; }
+        .login-box button { width: 100%; padding: 12px; background: linear-gradient(135deg, #238636, #2ea043); border: none; border-radius: 12px; color: white; font-weight: bold; cursor: pointer; margin-top: 16px; }
+        .login-box button:hover { transform: translateY(-1px); }
+        .error-text { color: #f85149; font-size: 12px; margin-top: 12px; }
+        .main-content { display: none; }
         .header { background: linear-gradient(135deg, rgba(22,27,34,0.95), rgba(13,17,23,0.95)); backdrop-filter: blur(10px); border-radius: 20px; padding: 14px 24px; margin-bottom: 20px; border: 1px solid rgba(48,54,61,0.5); text-align: center; }
         .header h1 { font-size: 24px; font-weight: 700; background: linear-gradient(135deg, #58a6ff, #3fb950, #f0883e); -webkit-background-clip: text; background-clip: text; color: transparent; }
         .header-sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
         .progress-bar { height: 2px; background: #21262d; border-radius: 2px; overflow: hidden; margin-top: 10px; }
         .progress-fill { height: 100%; background: linear-gradient(90deg, #3fb950, #58a6ff); width: 0%; transition: width 0.3s ease; }
-        
         .stats-top { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
         .stat-card { background: #161b22; border-radius: 14px; padding: 10px 12px; text-align: center; cursor: pointer; border: 1px solid #30363d; transition: all 0.2s; }
         .stat-card:hover { transform: translateY(-1px); border-color: #58a6ff; background: #1a1f2e; }
         .stat-number { font-size: 22px; font-weight: 700; color: #58a6ff; }
         .stat-label { font-size: 10px; color: #8b949e; margin-top: 3px; font-weight: 500; }
-        
         .results-section { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; margin-bottom: 20px; }
         .section-header { padding: 14px 20px; background: #0d1117; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 15px; }
         .section-header i { color: #58a6ff; margin-right: 8px; }
-        
         .filter-bar { display: flex; gap: 10px; padding: 12px 20px; background: #0d1117; border-bottom: 1px solid #21262d; flex-wrap: wrap; align-items: center; }
         .search-input { padding: 6px 14px; background: #010409; border: 1px solid #30363d; border-radius: 30px; color: white; width: 220px; font-size: 12px; }
         .search-input:focus { outline: none; border-color: #58a6ff; }
@@ -432,7 +463,6 @@ HTML_UI = '''<!DOCTYPE html>
         .balance-filter { display: flex; gap: 6px; margin-left: auto; }
         .balance-filter-btn { padding: 4px 10px; background: #21262d; border: none; border-radius: 30px; color: #8b949e; cursor: pointer; font-size: 10px; }
         .balance-filter-btn.active { background: #3fb950; color: white; }
-        
         .table-container { max-height: 520px; overflow-y: auto; }
         table { width: 100%; border-collapse: separate; border-spacing: 0; }
         th { background: #0d1117; padding: 12px 14px; text-align: left; font-size: 12px; font-weight: 600; color: #8b949e; cursor: pointer; position: sticky; top: 0; border-bottom: 1px solid #30363d; }
@@ -442,16 +472,13 @@ HTML_UI = '''<!DOCTYPE html>
         .balance-positive { color: #3fb950; font-weight: 600; }
         .balance-medium { color: #d29922; font-weight: 600; }
         .balance-zero { color: #f85149; }
-        
         .copy-btn, .retry-btn { background: transparent; border: none; cursor: pointer; font-size: 11px; padding: 3px 8px; border-radius: 6px; transition: all 0.2s; display: inline-flex; align-items: center; gap: 4px; }
         .copy-btn { color: #58a6ff; margin-left: 8px; }
         .copy-btn:hover { background: #30363d; color: #3fb950; }
         .retry-btn { color: #d29922; margin-left: 8px; }
         .retry-btn:hover { background: #30363d; color: #f0883e; }
-        
         .username-cell, .password-cell { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
         .error-cell { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
-        
         .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 0; }
         .card { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; }
         .card-header { padding: 12px 18px; background: #0d1117; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 13px; }
@@ -470,16 +497,13 @@ HTML_UI = '''<!DOCTYPE html>
         .btn-warning:hover { background: #f0883e; }
         .btn-info { background: #1f6feb; color: white; }
         .btn-info:hover { background: #388bfd; }
-        
         .terminal { background: #010409; height: 280px; overflow-y: auto; padding: 10px; font-family: 'Courier New', monospace; font-size: 10px; }
         .terminal-line { padding: 4px 0; color: #b1bac4; border-bottom: 1px solid #1a1f2e; }
         .terminal-line .time { color: #58a6ff; margin-right: 10px; }
-        
         ::-webkit-scrollbar { width: 6px; height: 6px; }
         ::-webkit-scrollbar-track { background: #161b22; border-radius: 3px; }
         ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
-        
         @media (max-width: 900px) {
             body { padding: 12px; }
             .bottom-grid { grid-template-columns: 1fr; }
@@ -491,6 +515,17 @@ HTML_UI = '''<!DOCTYPE html>
     </style>
 </head>
 <body>
+<div id="loginOverlay" class="login-overlay">
+    <div class="login-box">
+        <h2><i class="fas fa-shield-alt"></i> Authentication</h2>
+        <input type="text" id="loginUsername" placeholder="Username" autocomplete="off">
+        <input type="password" id="loginPassword" placeholder="Password">
+        <button onclick="doLogin()"><i class="fas fa-unlock-alt"></i> Login</button>
+        <div id="loginError" class="error-text"></div>
+    </div>
+</div>
+
+<div id="mainContent" class="main-content">
 <div class="container">
     <div class="header">
         <h1><i class="fas fa-crown"></i> Adjarabet Bot v26.0 | Concurrent Mode</h1>
@@ -545,19 +580,55 @@ HTML_UI = '''<!DOCTYPE html>
             <div class="card-header"><i class="fas fa-terminal"></i> Live Console</div>
             <div class="terminal" id="terminal">
                 <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v26.0 - CONCURRENT MODE</div>
-                <div class="terminal-line"><span class="time">●</span> 💡 {CONFIG['concurrent_limit']} tabs open simultaneously!</div>
+                <div class="terminal-line"><span class="time">●</span> 💡 3 tabs open simultaneously!</div>
                 <div class="terminal-line"><span class="time">●</span> 🔄 Stop → Start resumes from EXACT position</div>
             </div>
         </div>
     </div>
 </div>
+</div>
 
 <script>
 let ws = null, allResults = [], currentFilter = 'all', currentBalanceFilter = 'all', currentSort = { field: 'balance', dir: 'desc' };
+let wsToken = null;
 
-function connect() {
-    ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + window.location.host + '/ws');
-    ws.onopen = () => addLog('🟢 Connected');
+async function doLogin() {
+    const username = document.getElementById('loginUsername').value;
+    const password = document.getElementById('loginPassword').value;
+    const errorDiv = document.getElementById('loginError');
+    
+    if(!username || !password) {
+        errorDiv.innerText = 'Enter username and password';
+        return;
+    }
+    
+    try {
+        const res = await fetch('/token', {
+            method: 'POST',
+            headers: { 'Authorization': 'Basic ' + btoa(username + ':' + password) }
+        });
+        const data = await res.json();
+        if(res.ok && data.token) {
+            wsToken = data.token;
+            document.getElementById('loginOverlay').style.display = 'none';
+            document.getElementById('mainContent').style.display = 'block';
+            connectWebSocket();
+            await fetchResults();
+            startAutoRefresh();
+            addLog('✅ Authentication successful');
+        } else {
+            errorDiv.innerText = data.detail || 'Invalid credentials';
+        }
+    } catch(e) {
+        errorDiv.innerText = 'Connection error';
+    }
+}
+
+function connectWebSocket() {
+    if(ws) ws.close();
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${protocol}//${location.host}/ws?token=${wsToken}`);
+    ws.onopen = () => addLog('🟢 WebSocket connected');
     ws.onmessage = (e) => {
         let data = e.data;
         if (data.startsWith('RESULT:')) {
@@ -579,7 +650,33 @@ function connect() {
             addLog('✅ Bot completed all accounts!');
         } else if (!data.startsWith('STATUS:')) addLog(data);
     };
-    ws.onclose = () => { addLog('🔴 Reconnecting...'); setTimeout(connect, 3000); };
+    ws.onclose = () => { addLog('🔴 WebSocket closed'); setTimeout(connectWebSocket, 5000); };
+}
+
+async function fetchResults() {
+    try {
+        const res = await fetch('/results');
+        if(res.ok) {
+            const data = await res.json();
+            allResults = data;
+            renderResults(); updateStats();
+        }
+    } catch(e) {}
+}
+
+function startAutoRefresh() {
+    setInterval(async () => {
+        try {
+            const res = await fetch('/results');
+            if(res.ok) {
+                const data = await res.json();
+                if(JSON.stringify(data) !== JSON.stringify(allResults)) {
+                    allResults = data;
+                    renderResults(); updateStats();
+                }
+            }
+        } catch(e) {}
+    }, 5000);
 }
 
 async function copyToClipboard(text, type, btnElement) {
@@ -665,7 +762,7 @@ async function startBot() {
     try{
         let res=await fetch('/start',{method:'POST',body:acc}); 
         let data=await res.json(); 
-        if(data.status==='started') addLog(`✓ Started ${data.total} accounts (${CONFIG['concurrent_limit']} concurrent tabs)`);
+        if(data.status==='started') addLog(`✓ Started ${data.total} accounts (3 concurrent tabs)`);
     }catch(e){ addLog('❌ '+e.message);} 
 }
 
@@ -695,8 +792,6 @@ async function clearResultsOnly() {
 document.getElementById('accounts').value = localStorage.getItem('bot_accounts') || '';
 document.getElementById('accounts').addEventListener('input',()=>localStorage.setItem('bot_accounts',document.getElementById('accounts').value));
 document.getElementById('searchInput').addEventListener('input',()=>renderResults());
-connect();
-setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(JSON.stringify(d)!==JSON.stringify(allResults)){allResults=d;renderResults();updateStats();}}catch(e){}},5000);
 </script>
 </body>
 </html>'''
@@ -711,6 +806,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
     logger.info("✅ Stop → Start resumes from EXACT position")
     logger.info("✅ Each account gets INDEPENDENT browser tab")
+    logger.info(f"🔐 Auth enabled: {AUTH_USERNAME} / {AUTH_PASSWORD[:3]}***")
     logger.info("=" * 50)
     yield
     await bot.cleanup()
@@ -721,6 +817,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/")
 async def root():
     return HTMLResponse(HTML_UI)
+
+@app.post("/token")
+async def get_token(credentials: HTTPBasicCredentials = Depends(security)):
+    token = token_manager.create_token()
+    return {"token": token}
 
 @app.post("/start")
 async def start_bot(req: Request):
@@ -787,7 +888,12 @@ async def health():
     }
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, token: str = None):
+    if not token or not token_manager.verify_token(token):
+        await websocket.close(code=1008, reason="Unauthorized")
+        return
+    
+    token_manager.remove_token(token)
     await manager.connect(websocket)
     try:
         while True:
@@ -808,6 +914,7 @@ if __name__ == "__main__":
     print("🎮 ADJARABET BOT v26.0 - CONCURRENT MODE")
     print("=" * 60)
     print(f"📍 Web UI: http://{CONFIG['host']}:{CONFIG['port']}")
+    print(f"🔐 Login: {AUTH_USERNAME} / {AUTH_PASSWORD}")
     print(f"🔧 Headless: {CONFIG['headless']}")
     print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
     print(f"✅ Stop → Start resumes from EXACT position")
