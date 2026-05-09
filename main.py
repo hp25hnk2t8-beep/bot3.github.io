@@ -21,13 +21,14 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 CONFIG = {
     "port": int(os.getenv("PORT", 8000)),
     "host": os.getenv("HOST", "0.0.0.0"),
-    "headless": os.getenv("HEADLESS", "true").lower() == "true",
-    "timeout_nav": int(os.getenv("TIMEOUT_NAV", 9000)),
+    "headless": os.getenv("HEADLESS", "True").lower() == "true",
+    "timeout_nav": int(os.getenv("TIMEOUT_NAV", 15000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
-    "delay_between": float(os.getenv("DELAY_BETWEEN", 0.5)),
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),  # REAL concurrent tabs!
+    "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
 }
+
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -85,7 +86,7 @@ class ConnectionManager:
 
 class RateLimiter:
     __slots__ = ('max_req', 'window', 'timestamps')
-    def __init__(self, max_req: int = 6, window: float = 8.0):
+    def __init__(self, max_req: int = 5, window: float = 10.0):
         self.max_req = max_req
         self.window = window
         self.timestamps = deque()
@@ -105,27 +106,36 @@ class Bot:
         self.playwright = None
         self.browser = None
         self.results: List[Account] = []
-        self.semaphore = asyncio.Semaphore(CONFIG["concurrent_limit"])
+        self.all_accounts: List[Account] = []
+        self.current_index = 0
+        self.semaphore = None  # Will be initialized after browser is ready
         self.rate_limiter = RateLimiter()
         self._running = False
         self._stop_flag = False
-        self._remaining_accounts: List[Account] = []
-        self._processed_count = 0
-        self._total_accounts = 0
+        self._processing_task: Optional[asyncio.Task] = None
 
     async def init(self):
         logger.info("Starting browser...")
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=CONFIG["headless"],
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            args=[
+                '--no-sandbox', 
+                '--disable-setuid-sandbox', 
+                '--disable-dev-shm-usage', 
+                '--disable-gpu',
+                '--disable-blink-features=AutomationControlled'
+            ]
         )
+        self.semaphore = asyncio.Semaphore(CONFIG["concurrent_limit"])
         self._running = True
-        logger.info("✓ Browser ready")
+        logger.info(f"✓ Browser ready | Concurrent tabs: {CONFIG['concurrent_limit']}")
         return True
 
     async def cleanup(self):
         self._running = False
+        if self._processing_task and not self._processing_task.done():
+            self._processing_task.cancel()
         if self.browser:
             try:
                 await self.browser.close()
@@ -148,11 +158,16 @@ class Bot:
             pass
         return "0 ֏", 0.0
 
-    async def _login_one(self, acc: Account) -> Account:
+    async def _login_one(self, acc: Account, worker_id: int) -> Account:
+        """Process single account with its own context - REAL concurrent!"""
         ctx = None
         page = None
         try:
             await self.rate_limiter.acquire()
+            
+            logger.info(f"[Worker {worker_id}] 🔄 Processing: {acc.username}")
+            
+            # Each account gets its OWN independent context (REAL tab!)
             ctx = await self.browser.new_context(
                 viewport={'width': 1280, 'height': 720},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -165,33 +180,40 @@ class Bot:
                 if not self._running or self._stop_flag:
                     return acc
                 try:
+                    # Go to login page
                     await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                     
+                    # Check if already logged in
                     try:
-                        bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2500)
+                        bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2000)
                         if bal_el:
                             txt = await bal_el.inner_text()
                             acc.balance, acc.balance_value = self._parse_balance(txt)
                             acc.status = AccountStatus.SUCCESS
+                            logger.info(f"[Worker {worker_id}] ✅ Already logged in: {acc.username} | Balance: {acc.balance}")
                             return acc
                     except:
                         pass
                     
+                    # Fill login form
                     await page.fill('input[name="userIdentifier"]', acc.username, timeout=CONFIG["timeout_element"])
                     await page.fill('input[type="password"]', acc.password, timeout=CONFIG["timeout_element"])
                     await page.click('[data-test-id="header-login-button"]')
                     
+                    # Wait for balance to appear
                     bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=CONFIG["timeout_nav"])
                     txt = await bal_el.inner_text()
                     acc.balance, acc.balance_value = self._parse_balance(txt)
                     acc.status = AccountStatus.SUCCESS
+                    logger.info(f"[Worker {worker_id}] ✅ Login success: {acc.username} | Balance: {acc.balance}")
                     return acc
                     
                 except PlaywrightTimeout:
                     if attempt == CONFIG["max_retries"]:
                         acc.status = AccountStatus.TIMEOUT
                         acc.error = "Response timeout"
+                        logger.warning(f"[Worker {worker_id}] ⏰ Timeout: {acc.username}")
                     else:
                         await asyncio.sleep(1.5)
                         continue
@@ -199,6 +221,7 @@ class Bot:
                     if attempt == CONFIG["max_retries"]:
                         acc.status = AccountStatus.FAILED
                         acc.error = str(e)[:60]
+                        logger.warning(f"[Worker {worker_id}] ❌ Failed: {acc.username} | {str(e)[:50]}")
                     else:
                         await asyncio.sleep(1.5)
                         continue
@@ -207,6 +230,7 @@ class Bot:
         except Exception as e:
             acc.status = AccountStatus.FAILED
             acc.error = str(e)[:60]
+            logger.error(f"[Worker {worker_id}] ❌ Exception: {acc.username} | {str(e)[:50]}")
             return acc
         finally:
             if page:
@@ -220,54 +244,67 @@ class Bot:
                 except:
                     pass
 
+    async def _worker(self, acc: Account, worker_id: int, manager: ConnectionManager):
+        """Worker for single account - runs in semaphore for concurrency control"""
+        async with self.semaphore:
+            if self._stop_flag:
+                return acc
+            result = await self._login_one(acc, worker_id)
+            self.results.append(result)
+            self.current_index += 1
+            await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
+            await manager.broadcast(f"PROGRESS:{self.current_index}/{len(self.all_accounts)}")
+            return result
+
     async def start(self, accounts: List[Account], manager: ConnectionManager):
-        """Start or resume processing"""
-        if self._remaining_accounts and self._processed_count > 0:
-            # Resume mode
-            logger.info(f"▶ RESUMING from account {self._processed_count + 1}/{self._total_accounts}")
-            await manager.broadcast(f"STATUS:resuming from {self._processed_count + 1}")
+        """Start or resume processing with REAL concurrent tabs"""
+        # Check if we're resuming
+        if self.all_accounts and self.current_index > 0 and self.current_index < len(self.all_accounts):
+            logger.info(f"▶ RESUMING from account {self.current_index + 1}/{len(self.all_accounts)}")
+            await manager.broadcast(f"STATUS:resuming from {self.current_index + 1}")
         else:
-            # Fresh start
+            self.all_accounts = accounts.copy()
             self.results = []
-            self._remaining_accounts = accounts.copy()
-            self._processed_count = 0
-            self._total_accounts = len(accounts)
-            logger.info(f"▶ FRESH START: {self._total_accounts} accounts")
+            self.current_index = 0
+            logger.info(f"▶ FRESH START: {len(accounts)} accounts")
+            await manager.broadcast(f"STATUS:started")
         
-        total = self._total_accounts
+        total = len(self.all_accounts)
         start_time = time.time()
         self._stop_flag = False
+        self._running = True
         
-        await manager.broadcast("STATUS:started")
-        await manager.broadcast(f"PROGRESS:{self._processed_count}/{total}")
+        await manager.broadcast(f"PROGRESS:{self.current_index}/{total}")
 
-        async def worker(acc: Account):
-            async with self.semaphore:
-                if self._stop_flag:
-                    return acc
-                res = await self._login_one(acc)
-                self.results.append(res)
-                self._processed_count += 1
-                # Remove from remaining
-                if self._remaining_accounts and self._remaining_accounts[0].username == acc.username:
-                    self._remaining_accounts.pop(0)
-                await manager.broadcast(f"RESULT:{json.dumps(res.to_dict())}")
-                await manager.broadcast(f"PROGRESS:{self._processed_count}/{total}")
-                return res
-
+        # Get remaining accounts
+        remaining_accounts = self.all_accounts[self.current_index:]
+        
+        if not remaining_accounts:
+            logger.info("No accounts to process")
+            await manager.broadcast("STATUS:completed")
+            self._running = False
+            return
+        
+        # Process accounts with REAL concurrency!
+        logger.info(f"🚀 Starting concurrent processing with {CONFIG['concurrent_limit']} tabs")
+        
+        # Create tasks for all remaining accounts (semaphore will limit concurrency)
         tasks = []
-        for i, acc in enumerate(self._remaining_accounts.copy()):
+        for i, acc in enumerate(remaining_accounts):
             if self._stop_flag:
                 break
-            tasks.append(asyncio.create_task(worker(acc)))
-            if (i + 1) % CONFIG["concurrent_limit"] == 0:
-                await asyncio.sleep(CONFIG["delay_between"])
-
-        if tasks and not self._stop_flag:
+            worker_id = (self.current_index + i) % CONFIG["concurrent_limit"]
+            task = asyncio.create_task(self._worker(acc, worker_id, manager))
+            tasks.append(task)
+            
+            # Small delay between starting tasks to avoid rate limiting
+            await asyncio.sleep(CONFIG["delay_between"])
+        
+        # Wait for all tasks to complete
+        if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-
+        
         if not self._stop_flag:
-            self._remaining_accounts = []
             await self._save_results()
             
             elapsed = time.time() - start_time
@@ -278,20 +315,32 @@ class Bot:
             rate_per_sec = len(self.results) / elapsed if elapsed > 0 else 0
             logger.info(f"📊 Complete: {elapsed:.1f}s | {rate_per_sec:.2f} acc/sec | ✅{success} ❌{fail} ⏰{to}")
             await manager.broadcast(f"SUMMARY:{success}/{len(self.results)}:{success/len(self.results)*100:.1f}")
-            await manager.broadcast("STATUS:stopped")
+            await manager.broadcast("STATUS:completed")
+        
+        self._running = False
 
     async def stop(self):
+        """Stop current processing"""
         self._stop_flag = True
-        await asyncio.sleep(0.5)
+        await manager.broadcast("STATUS:stopped")
+        logger.info(f"⏹ Stopped at account {self.current_index}/{len(self.all_accounts)}")
 
     async def reset(self):
         """Reset everything - fresh start on next run"""
+        self.all_accounts = []
         self.results = []
-        self._remaining_accounts = []
-        self._processed_count = 0
-        self._total_accounts = 0
+        self.current_index = 0
         self._stop_flag = False
+        self._running = False
         Path("results/results.json").unlink(missing_ok=True)
+        logger.info("🔄 Bot reset - fresh start ready")
+
+    async def clear_results(self):
+        """Clear only results table, keep accounts"""
+        self.results = []
+        self.current_index = 0
+        Path("results/results.json").unlink(missing_ok=True)
+        logger.info("🗑 Results cleared")
 
     async def _save_results(self):
         try:
@@ -318,9 +367,9 @@ manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
 
-async def retry_single_account(acc: Account, manager: ConnectionManager):
+async def retry_single_account(acc: Account):
     try:
-        result = await bot._login_one(acc)
+        result = await bot._login_one(acc, 99)  # worker_id=99 for retry
         
         existing_index = None
         for i, r in enumerate(bot.results):
@@ -333,20 +382,25 @@ async def retry_single_account(acc: Account, manager: ConnectionManager):
         else:
             bot.results.append(result)
         
+        for i, a in enumerate(bot.all_accounts):
+            if a.username == result.username:
+                bot.all_accounts[i] = result
+                break
+        
         await bot._save_results()
-        await manager.broadcast(f"RESULT_UPDATE:{json.dumps(result.to_dict())}")
-        await manager.broadcast(f"RETRY_COMPLETE:{result.username}:{result.status.value}")
+        await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
         logger.info(f"🔄 Retry completed for {result.username}: {result.status.value}")
+        return result
     except Exception as e:
         logger.error(f"Retry failed for {acc.username}: {e}")
-        await manager.broadcast(f"RETRY_ERROR:{acc.username}:{str(e)[:50]}")
+        return None
 
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adjarabet Bot | Ultimate</title>
+    <title>Adjarabet Bot | Concurrent v26.0</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -392,11 +446,8 @@ HTML_UI = '''<!DOCTYPE html>
         .copy-btn, .retry-btn { background: transparent; border: none; cursor: pointer; font-size: 11px; padding: 3px 8px; border-radius: 6px; transition: all 0.2s; display: inline-flex; align-items: center; gap: 4px; }
         .copy-btn { color: #58a6ff; margin-left: 8px; }
         .copy-btn:hover { background: #30363d; color: #3fb950; }
-        .copy-btn.copied { color: #3fb950; }
         .retry-btn { color: #d29922; margin-left: 8px; }
         .retry-btn:hover { background: #30363d; color: #f0883e; }
-        .retry-btn.retrying { color: #3fb950; animation: spin 1s linear infinite; }
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
         
         .username-cell, .password-cell { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
         .error-cell { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
@@ -417,6 +468,8 @@ HTML_UI = '''<!DOCTYPE html>
         .btn-secondary:hover { background: #8b949e; }
         .btn-warning { background: #d29922; color: #0a0c10; }
         .btn-warning:hover { background: #f0883e; }
+        .btn-info { background: #1f6feb; color: white; }
+        .btn-info:hover { background: #388bfd; }
         
         .terminal { background: #010409; height: 280px; overflow-y: auto; padding: 10px; font-family: 'Courier New', monospace; font-size: 10px; }
         .terminal-line { padding: 4px 0; color: #b1bac4; border-bottom: 1px solid #1a1f2e; }
@@ -440,8 +493,8 @@ HTML_UI = '''<!DOCTYPE html>
 <body>
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-crown"></i> Adjarabet Bot Ultimate v24.0</h1>
-        <div class="header-sub">⚡ Resume from where stopped | One-click copy | Retry failed</div>
+        <h1><i class="fas fa-crown"></i> Adjarabet Bot v26.0 | Concurrent Mode</h1>
+        <div class="header-sub">⚡ REAL CONCURRENT TABS: 3 accounts simultaneously | Stop → Start resumes</div>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
 
@@ -471,7 +524,7 @@ HTML_UI = '''<!DOCTYPE html>
         <div class="table-container">
             <table id="resultsTable">
                 <thead><tr><th onclick="sortBy('status')"><i class="fas fa-flag"></i> Status</th><th onclick="sortBy('username')"><i class="fas fa-user"></i> Username</th><th onclick="sortBy('password')"><i class="fas fa-key"></i> Password</th><th onclick="sortBy('balance')"><i class="fas fa-coins"></i> Balance</th><th>Action</th></tr></thead>
-                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</tr></tr></tbody>
+                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -479,20 +532,21 @@ HTML_UI = '''<!DOCTYPE html>
     <div class="bottom-grid">
         <div class="card">
             <div class="card-header"><i class="fas fa-users"></i> Accounts Input (username:password)</div>
-            <textarea id="accounts" placeholder="user1:pass123&#10;user2:pass456"></textarea>
+            <textarea id="accounts" placeholder="user1:pass123&#10;user2:pass456&#10;user3:pass789"></textarea>
             <div class="button-group">
                 <button class="btn btn-primary" onclick="startBot()"><i class="fas fa-play"></i> Start / Resume</button>
                 <button class="btn btn-danger" onclick="stopBot()"><i class="fas fa-stop"></i> Stop</button>
-                <button class="btn btn-secondary" onclick="clearAccounts()"><i class="fas fa-trash"></i> Clear Input</button>
                 <button class="btn btn-warning" onclick="resetBot()"><i class="fas fa-bomb"></i> Reset All</button>
-                <button class="btn btn-secondary" onclick="clearTerminal()"><i class="fas fa-eraser"></i> Clear Terminal</button>
+                <button class="btn btn-info" onclick="clearResultsOnly()"><i class="fas fa-eraser"></i> Clear Results</button>
+                <button class="btn btn-secondary" onclick="clearTerminal()"><i class="fas fa-trash"></i> Clear Terminal</button>
             </div>
         </div>
         <div class="card">
             <div class="card-header"><i class="fas fa-terminal"></i> Live Console</div>
             <div class="terminal" id="terminal">
-                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready</div>
-                <div class="terminal-line"><span class="time">●</span> 💡 Stop → Start resumes from exact position</div>
+                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v26.0 - CONCURRENT MODE</div>
+                <div class="terminal-line"><span class="time">●</span> 💡 {CONFIG['concurrent_limit']} tabs open simultaneously!</div>
+                <div class="terminal-line"><span class="time">●</span> 🔄 Stop → Start resumes from EXACT position</div>
             </div>
         </div>
     </div>
@@ -514,17 +568,6 @@ function connect() {
                 renderResults(); updateStats();
                 addLog(`${result.status} ${result.username.padEnd(18)} | ${result.balance}`);
             } catch(e) {}
-        } else if (data.startsWith('RESULT_UPDATE:')) {
-            try {
-                let result = JSON.parse(data.substring(14));
-                let idx = allResults.findIndex(x => x.username === result.username);
-                idx >= 0 ? allResults[idx] = result : allResults.push(result);
-                renderResults(); updateStats();
-                addLog(`🔄 Updated: ${result.status} ${result.username} | ${result.balance}`);
-            } catch(e) {}
-        } else if (data.startsWith('RETRY_COMPLETE:')) {
-            let parts = data.substring(15).split(':');
-            addLog(`✅ Retry complete for ${parts[0]}: ${parts[1]}`);
         } else if (data.startsWith('PROGRESS:')) {
             let p = data.substring(9).split('/');
             document.getElementById('progressFill').style.width = (p[0]/p[1]*100) + '%';
@@ -532,6 +575,8 @@ function connect() {
             addLog('📊 ' + data.substring(8));
         } else if (data.startsWith('STATUS:resuming')) {
             addLog('🔄 ' + data.substring(14));
+        } else if (data.startsWith('STATUS:completed')) {
+            addLog('✅ Bot completed all accounts!');
         } else if (!data.startsWith('STATUS:')) addLog(data);
     };
     ws.onclose = () => { addLog('🔴 Reconnecting...'); setTimeout(connect, 3000); };
@@ -542,9 +587,8 @@ async function copyToClipboard(text, type, btnElement) {
         await navigator.clipboard.writeText(text);
         let original = btnElement.innerHTML;
         btnElement.innerHTML = '<i class="fas fa-check"></i> ✓';
-        btnElement.classList.add('copied');
         addLog(`📋 Copied ${type}: ${text.substring(0, 25)}${text.length > 25 ? '...' : ''}`);
-        setTimeout(() => { btnElement.innerHTML = original; btnElement.classList.remove('copied'); }, 1500);
+        setTimeout(() => { btnElement.innerHTML = original; }, 1500);
     } catch(err) {
         let textarea = document.createElement('textarea');
         textarea.value = text;
@@ -555,22 +599,17 @@ async function copyToClipboard(text, type, btnElement) {
         addLog(`📋 Copied ${type}: ${text.substring(0, 25)}${text.length > 25 ? '...' : ''}`);
         let original = btnElement.innerHTML;
         btnElement.innerHTML = '<i class="fas fa-check"></i> ✓';
-        btnElement.classList.add('copied');
-        setTimeout(() => { btnElement.innerHTML = original; btnElement.classList.remove('copied'); }, 1500);
+        setTimeout(() => { btnElement.innerHTML = original; }, 1500);
     }
 }
 
 async function retryAccount(username) {
     addLog(`🔄 Retrying: ${username}...`);
-    let targetBtn = null;
-    document.querySelectorAll('.retry-btn').forEach(btn => { if(btn.getAttribute('onclick')?.includes(username)) targetBtn = btn; });
-    if(targetBtn) { targetBtn.disabled = true; targetBtn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>'; targetBtn.classList.add('retrying'); }
     try {
         let res = await fetch(`/retry/${encodeURIComponent(username)}`, { method: 'POST' });
         let data = await res.json();
         addLog(data.status === 'retry_started' ? `✓ Retry started for ${username}` : `❌ Retry failed: ${data.error}`);
     } catch(e) { addLog(`❌ Retry error: ${e.message}`); }
-    finally { if(targetBtn) setTimeout(() => { targetBtn.disabled = false; targetBtn.innerHTML = '<i class="fas fa-sync-alt"></i>'; targetBtn.classList.remove('retrying'); }, 3000); }
 }
 
 function renderResults() {
@@ -597,7 +636,7 @@ function renderResults() {
         return currentSort.dir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
     });
     let balanceClass = (v) => { let n = parseFloat(v)||0; return n>100?'balance-positive':n>10?'balance-medium':'balance-zero'; };
-    document.getElementById('resultsBody').innerHTML = filtered.map(r => `<tr><td style="font-size:18px">${r.status}</td><td><div class="username-cell"><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username).replace(/'/g,"\\'")}','username',this)"><i class="fas fa-copy"></i></button></div></td><td><div class="password-cell">${escapeHtml(r.password)}<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.password).replace(/'/g,"\\'")}','password',this)"><i class="fas fa-key"></i></button></div></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td><td class="error-cell">${escapeHtml(r.error||'-')}<button class="retry-btn" onclick="retryAccount('${escapeHtml(r.username).replace(/'/g,"\\'")}')"><i class="fas fa-sync-alt"></i></button></td></tr>`).join('');
+    document.getElementById('resultsBody').innerHTML = filtered.map(r => `<tr><td style="font-size:18px">${r.status}</td><td><div class="username-cell"><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username).replace(/'/g,"\\'")}','username',this)"><i class="fas fa-copy"></i></button></div></td><td><div class="password-cell">${escapeHtml(r.password)}<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.password).replace(/'/g,"\\'")}','password',this)"><i class="fas fa-key"></i></button></div></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td><td class="error-cell">${escapeHtml(r.error||'-')}<button class="retry-btn" onclick="retryAccount('${escapeHtml(r.username).replace(/'/g,"\\'")}')"><i class="fas fa-sync-alt"></i> Retry</button></div></td></tr>`).join('');
     if(filtered.length===0 && allResults.length>0) document.getElementById('resultsBody').innerHTML='<tr><td colspan="5" style="text-align:center;padding:40px"><i class="fas fa-search"></i> No results</td></tr>';
 }
 
@@ -616,42 +655,48 @@ function sortBy(field) {
 function setFilter(f) { currentFilter = f; document.querySelectorAll('.filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.filter===f)); renderResults(); }
 function setBalanceFilter(f) { currentBalanceFilter = f; document.querySelectorAll('.balance-filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.balance===f)); renderResults(); }
 function escapeHtml(s) { if(!s) return ''; return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]); }
-function addLog(msg) { let term=document.getElementById('terminal'); let div=document.createElement('div'); div.className='terminal-line'; div.innerHTML=`<span class="time">[${new Date().toLocaleTimeString()}]</span> ${msg}`; term.appendChild(div);  if(term.children.length>300) term.removeChild(term.firstChild); }
-function clearTerminal() { document.getElementById('terminal').innerHTML = '<div class="terminal-line"><span class="time">●</span> 🧹 Terminal cleared</div>'; addLog('Terminal cleared'); }
+function addLog(msg) { let term=document.getElementById('terminal'); let div=document.createElement('div'); div.className='terminal-line'; div.innerHTML=`<span class="time">[${new Date().toLocaleTimeString()}]</span> ${msg}`; term.appendChild(div); if(term.children.length>300) term.removeChild(term.firstChild); }
+function clearTerminal() { document.getElementById('terminal').innerHTML = '<div class="terminal-line"><span class="time">●</span> 🧹 Terminal cleared</div>'; }
 
 async function startBot() { 
     let acc = document.getElementById('accounts').value; 
     if(!acc.trim()){ addLog('❌ Enter accounts'); return; } 
-    addLog('🚀 Starting/Resuming...'); 
+    addLog('🚀 Starting with CONCURRENT mode...'); 
     try{
         let res=await fetch('/start',{method:'POST',body:acc}); 
         let data=await res.json(); 
-        if(data.status==='started') addLog(`✓ Started ${data.total} accounts (will resume from where stopped)`);
+        if(data.status==='started') addLog(`✓ Started ${data.total} accounts (${CONFIG['concurrent_limit']} concurrent tabs)`);
     }catch(e){ addLog('❌ '+e.message);} 
 }
 
 async function stopBot() { 
-    addLog('⏹ Stopping... (will resume from this position)'); 
+    addLog('⏹ Stopping... (will resume from this exact position)'); 
     await fetch('/stop',{method:'POST'}); 
 }
 
 async function resetBot() {
-    if(confirm('⚠️ RESET EVERYTHING? This will clear all results and start fresh next time!')){
+    if(confirm('⚠️ RESET EVERYTHING? This will clear all results and start fresh!')){
         await fetch('/reset',{method:'POST'});
         allResults=[]; renderResults(); updateStats();
         document.getElementById('accounts').value = '';
         localStorage.removeItem('bot_accounts');
-        document.getElementById('terminal').innerHTML = '<div class="terminal-line"><span class="time">●</span> 🔄 Bot reset - fresh start ready</div>';
         addLog('🔄 BOT RESET - Next start will begin from first account');
     }
 }
 
-function clearAccounts() { document.getElementById('accounts').value=''; addLog('🗑 Input cleared'); localStorage.removeItem('bot_accounts'); }
+async function clearResultsOnly() {
+    if(confirm('🗑 Clear results table only?')){
+        await fetch('/clear-results',{method:'POST'});
+        allResults=[]; renderResults(); updateStats();
+        addLog('🗑 Results cleared');
+    }
+}
+
 document.getElementById('accounts').value = localStorage.getItem('bot_accounts') || '';
 document.getElementById('accounts').addEventListener('input',()=>localStorage.setItem('bot_accounts',document.getElementById('accounts').value));
 document.getElementById('searchInput').addEventListener('input',()=>renderResults());
 connect();
-setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(d.length!==allResults.length){allResults=d;renderResults();updateStats();}}catch(e){}},5000);
+setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(JSON.stringify(d)!==JSON.stringify(allResults)){allResults=d;renderResults();updateStats();}}catch(e){}},5000);
 </script>
 </body>
 </html>'''
@@ -660,16 +705,17 @@ setInterval(async()=>{try{let r=await fetch('/results');let d=await r.json();if(
 async def lifespan(app: FastAPI):
     await bot.init()
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT v24.0 - ULTIMATE FINAL")
+    logger.info("🎮 ADJARABET BOT v26.0 - CONCURRENT MODE")
     logger.info(f"📍 Host: {CONFIG['host']}:{CONFIG['port']}")
-    logger.info(f"⚡ Concurrent: {CONFIG['concurrent_limit']} | Timeout: {CONFIG['timeout_nav']}ms")
+    logger.info(f"⚡ REAL Concurrent tabs: {CONFIG['concurrent_limit']}")
+    logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
+    logger.info("✅ Stop → Start resumes from EXACT position")
+    logger.info("✅ Each account gets INDEPENDENT browser tab")
     logger.info("=" * 50)
     yield
-    if processing_task and not processing_task.done():
-        processing_task.cancel()
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot Ultimate", version="24.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot Concurrent", version="26.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -699,18 +745,18 @@ async def start_bot(req: Request):
 
 @app.post("/stop")
 async def stop_bot():
-    global processing_task
     await bot.stop()
-    if processing_task and not processing_task.done():
-        processing_task.cancel()
-    await manager.broadcast("STATUS:stopped")
     return {"status": "stopped"}
 
 @app.post("/reset")
 async def reset_bot():
     await bot.reset()
-    await manager.broadcast("STATUS:reset")
     return {"status": "reset"}
+
+@app.post("/clear-results")
+async def clear_results():
+    await bot.clear_results()
+    return {"status": "cleared"}
 
 @app.post("/retry/{username}")
 async def retry_account(username: str):
@@ -723,7 +769,7 @@ async def retry_account(username: str):
     if not account_data:
         return JSONResponse({"error": "Account not found"}, 404)
     acc = Account(account_data["username"], account_data["password"])
-    asyncio.create_task(retry_single_account(acc, manager))
+    asyncio.create_task(retry_single_account(acc))
     return {"status": "retry_started", "username": username}
 
 @app.get("/results")
@@ -732,7 +778,13 @@ async def get_results():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "bot_running": bot._running, "total_processed": len(bot.results)}
+    return {
+        "status": "healthy", 
+        "current_index": bot.current_index, 
+        "total": len(bot.all_accounts), 
+        "total_processed": len(bot.results),
+        "concurrent_limit": CONFIG["concurrent_limit"]
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -753,13 +805,14 @@ if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
     print("\n" + "=" * 60)
-    print("🎮 ADJARABET BOT v24.0 - ULTIMATE FINAL")
+    print("🎮 ADJARABET BOT v26.0 - CONCURRENT MODE")
     print("=" * 60)
     print(f"📍 Web UI: http://{CONFIG['host']}:{CONFIG['port']}")
     print(f"🔧 Headless: {CONFIG['headless']}")
-    print(f"⚡ Concurrent: {CONFIG['concurrent_limit']} accounts")
-    print(f"📋 Copy | ⟳ Retry | 🔍 Search | 💰 Balance filters")
-    print(f"⏸️ Stop → Start resumes from EXACT same position")
-    print(f"🔄 Reset button for fresh start")
+    print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
+    print(f"✅ Stop → Start resumes from EXACT position")
+    print(f"✅ Each account gets INDEPENDENT browser tab")
+    print(f"🔄 Reset All - fresh start")
+    print(f"🗑 Clear Results - clear table only")
     print("=" * 60 + "\n")
     uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], log_level="warning", access_log=False)
