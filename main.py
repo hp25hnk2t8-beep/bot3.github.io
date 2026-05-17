@@ -28,7 +28,6 @@ AUTH_PASSWORD = os.getenv("BOT_PASSWORD")
 DASHBOARD_PIN = os.getenv("DASHBOARD_PIN", "0000")
 MOBILE_PIN = os.getenv("MOBILE_PIN", "1111")
 
-# Validate that credentials exist in .env
 if not AUTH_USERNAME or not AUTH_PASSWORD:
     raise ValueError("❌ BOT_USERNAME and BOT_PASSWORD must be set in .env file")
 
@@ -45,7 +44,7 @@ def verify_auth(credentials: HTTPBasicCredentials = Depends(security)):
         )
     return credentials.username
 
-# ================= TOKEN MANAGER FOR WEBSOCKET =================
+# ================= TOKEN MANAGER =================
 class TokenManager:
     def __init__(self):
         self.tokens: Dict[str, datetime] = {}
@@ -78,6 +77,8 @@ CONFIG = {
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
+    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",  # NEW: անվերջ ցիկլ
+    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),  # NEW: դադար ցիկլերի արանքում
 }
 
 logging.basicConfig(
@@ -164,6 +165,7 @@ class Bot:
         self._running = False
         self._stop_flag = False
         self._processing_task: Optional[asyncio.Task] = None
+        self._loop_task: Optional[asyncio.Task] = None  # NEW: loop task
 
     async def init(self):
         logger.info("Starting browser...")
@@ -181,12 +183,15 @@ class Bot:
         self.semaphore = asyncio.Semaphore(CONFIG["concurrent_limit"])
         self._running = True
         logger.info(f"✓ Browser ready | Concurrent tabs: {CONFIG['concurrent_limit']}")
+        logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'} (will restart from beginning after completion)")
         return True
 
     async def cleanup(self):
         self._running = False
         if self._processing_task and not self._processing_task.done():
             self._processing_task.cancel()
+        if self._loop_task and not self._loop_task.done():
+            self._loop_task.cancel()
         if self.browser:
             try:
                 await self.browser.close()
@@ -300,31 +305,26 @@ class Bot:
             await manager.broadcast(f"PROGRESS:{self.current_index}/{len(self.all_accounts)}")
             return result
 
-    async def start(self, accounts: List[Account], manager: ConnectionManager):
-        if self.all_accounts and self.current_index > 0 and self.current_index < len(self.all_accounts):
-            logger.info(f"▶ RESUMING from account {self.current_index + 1}/{len(self.all_accounts)}")
-            await manager.broadcast(f"STATUS:resuming from {self.current_index + 1}")
-        else:
-            self.all_accounts = accounts.copy()
-            self.results = []
-            self.current_index = 0
-            logger.info(f"▶ FRESH START: {len(accounts)} accounts")
-            await manager.broadcast(f"STATUS:started")
+    async def _run_one_cycle(self, accounts: List[Account], manager: ConnectionManager) -> bool:
+        """Execute one full cycle of all accounts. Returns True if completed normally."""
+        self.all_accounts = accounts.copy()
+        self.results = []
+        self.current_index = 0
+        self._stop_flag = False
         
         total = len(self.all_accounts)
         start_time = time.time()
-        self._stop_flag = False
-        self._running = True
         
+        logger.info(f"🔄 Starting NEW CYCLE: {total} accounts")
+        await manager.broadcast(f"STATUS:started_cycle")
         await manager.broadcast(f"PROGRESS:{self.current_index}/{total}")
-
+        
         remaining_accounts = self.all_accounts[self.current_index:]
         
         if not remaining_accounts:
             logger.info("No accounts to process")
-            await manager.broadcast("STATUS:completed")
-            self._running = False
-            return
+            await manager.broadcast("STATUS:cycle_empty")
+            return True
         
         logger.info(f"🚀 Starting concurrent processing with {CONFIG['concurrent_limit']} tabs")
         
@@ -332,7 +332,7 @@ class Bot:
         for i, acc in enumerate(remaining_accounts):
             if self._stop_flag:
                 break
-            worker_id = (self.current_index + i) % CONFIG["concurrent_limit"]
+            worker_id = i % CONFIG["concurrent_limit"]
             task = asyncio.create_task(self._worker(acc, worker_id, manager))
             tasks.append(task)
             await asyncio.sleep(CONFIG["delay_between"])
@@ -349,15 +349,71 @@ class Bot:
             to = sum(1 for r in self.results if r.status == AccountStatus.TIMEOUT)
             
             rate_per_sec = len(self.results) / elapsed if elapsed > 0 else 0
-            logger.info(f"📊 Complete: {elapsed:.1f}s | {rate_per_sec:.2f} acc/sec | ✅{success} ❌{fail} ⏰{to}")
+            logger.info(f"📊 Cycle complete: {elapsed:.1f}s | {rate_per_sec:.2f} acc/sec | ✅{success} ❌{fail} ⏰{to}")
             await manager.broadcast(f"SUMMARY:{success}/{len(self.results)}:{success/len(self.results)*100:.1f}")
-            await manager.broadcast("STATUS:completed")
+            await manager.broadcast("STATUS:cycle_completed")
+            return True
+        
+        return False
+
+    async def start(self, accounts: List[Account], manager: ConnectionManager):
+        """Start bot - runs in loop mode if enabled"""
+        if self._loop_task and not self._loop_task.done():
+            self._loop_task.cancel()
+            await asyncio.sleep(0.5)
+        
+        if CONFIG["loop_mode"]:
+            # NEW: Infinite loop mode
+            self._loop_task = asyncio.create_task(self._run_loop(accounts, manager))
+            logger.info(f"▶ LOOP MODE STARTED - will run continuously")
+            await manager.broadcast("STATUS:loop_mode_started")
+        else:
+            # Single run mode (original behavior)
+            self._processing_task = asyncio.create_task(self._run_one_cycle(accounts, manager))
+            logger.info(f"▶ SINGLE RUN MODE - will stop after one cycle")
+            await manager.broadcast("STATUS:started")
+
+    async def _run_loop(self, original_accounts: List[Account], manager: ConnectionManager):
+        """Infinite loop: repeatedly process all accounts"""
+        cycle_number = 0
+        self._running = True
+        
+        while self._running and not self._stop_flag:
+            cycle_number += 1
+            logger.info(f"🔄 ===== LOOP CYCLE #{cycle_number} STARTING =====")
+            await manager.broadcast(f"STATUS:loop_cycle_{cycle_number}")
+            
+            # Create fresh copy of accounts for this cycle
+            accounts_copy = [Account(acc.username, acc.password) for acc in original_accounts]
+            
+            # Run one cycle
+            completed = await self._run_one_cycle(accounts_copy, manager)
+            
+            if not self._running or self._stop_flag:
+                logger.info(f"⏹ Loop stopped at cycle #{cycle_number}")
+                await manager.broadcast("STATUS:loop_stopped")
+                break
+            
+            if completed and CONFIG["loop_mode"]:
+                logger.info(f"✅ Cycle #{cycle_number} completed. Waiting {CONFIG['loop_delay']}s before next cycle...")
+                await manager.broadcast(f"STATUS:waiting_next_cycle:{CONFIG['loop_delay']}")
+                
+                # Wait before next cycle
+                for _ in range(int(CONFIG['loop_delay'])):
+                    if self._stop_flag or not self._running:
+                        break
+                    await asyncio.sleep(1)
+                
+                if not self._stop_flag and self._running:
+                    logger.info(f"🔄 Starting CYCLE #{cycle_number + 1}")
+                    await manager.broadcast("STATUS:starting_next_cycle")
         
         self._running = False
+        logger.info("Loop finished")
 
     async def stop(self):
         self._stop_flag = True
-        logger.info(f"⏹ Stopped at account {self.current_index}/{len(self.all_accounts)}")
+        logger.info(f"⏹ Stop signal sent")
 
     async def reset(self):
         self.all_accounts = []
@@ -365,6 +421,10 @@ class Bot:
         self.current_index = 0
         self._stop_flag = False
         self._running = False
+        if self._loop_task and not self._loop_task.done():
+            self._loop_task.cancel()
+        if self._processing_task and not self._processing_task.done():
+            self._processing_task.cancel()
         Path("results/results.json").unlink(missing_ok=True)
         logger.info("🔄 Bot reset - fresh start ready")
 
@@ -433,7 +493,7 @@ HTML_UI = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adjarabet Bot | Concurrent v26.0</title>
+    <title>Adjarabet Bot | LOOP MODE v27.0</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -451,6 +511,7 @@ HTML_UI = '''<!DOCTYPE html>
         .header { background: linear-gradient(135deg, rgba(22,27,34,0.95), rgba(13,17,23,0.95)); backdrop-filter: blur(10px); border-radius: 20px; padding: 14px 24px; margin-bottom: 20px; border: 1px solid rgba(48,54,61,0.5); text-align: center; }
         .header h1 { font-size: 24px; font-weight: 700; background: linear-gradient(135deg, #58a6ff, #3fb950, #f0883e); -webkit-background-clip: text; background-clip: text; color: transparent; }
         .header-sub { font-size: 12px; color: #8b949e; margin-top: 4px; }
+        .loop-badge { display: inline-block; background: #d29922; color: #0a0c10; padding: 2px 10px; border-radius: 30px; font-size: 11px; font-weight: bold; margin-left: 10px; }
         .progress-bar { height: 2px; background: #21262d; border-radius: 2px; overflow: hidden; margin-top: 10px; }
         .progress-fill { height: 100%; background: linear-gradient(90deg, #3fb950, #58a6ff); width: 0%; transition: width 0.3s ease; }
         .stats-top { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
@@ -458,15 +519,14 @@ HTML_UI = '''<!DOCTYPE html>
         .stat-card:hover { transform: translateY(-1px); border-color: #58a6ff; background: #1a1f2e; }
         .stat-number { font-size: 22px; font-weight: 700; color: #58a6ff; }
         .stat-label { font-size: 10px; color: #8b949e; margin-top: 3px; font-weight: 500; }
+        .cycle-info { font-size: 11px; color: #d29922; margin-top: 5px; }
         .results-section { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; margin-bottom: 20px; }
         .section-header { padding: 14px 20px; background: #0d1117; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 15px; }
         .section-header i { color: #58a6ff; margin-right: 8px; }
         .filter-bar { display: flex; gap: 10px; padding: 12px 20px; background: #0d1117; border-bottom: 1px solid #21262d; flex-wrap: wrap; align-items: center; }
         .search-input { padding: 6px 14px; background: #010409; border: 1px solid #30363d; border-radius: 30px; color: white; width: 220px; font-size: 12px; }
-        .search-input:focus { outline: none; border-color: #58a6ff; }
         .filter-btn { padding: 5px 14px; background: #21262d; border: none; border-radius: 30px; color: #8b949e; cursor: pointer; font-size: 11px; font-weight: 500; }
         .filter-btn.active { background: #58a6ff; color: white; }
-        .filter-btn:hover:not(.active) { background: #30363d; color: #e6edf3; }
         .balance-filter { display: flex; gap: 6px; margin-left: auto; }
         .balance-filter-btn { padding: 4px 10px; background: #21262d; border: none; border-radius: 30px; color: #8b949e; cursor: pointer; font-size: 10px; }
         .balance-filter-btn.active { background: #3fb950; color: white; }
@@ -484,8 +544,6 @@ HTML_UI = '''<!DOCTYPE html>
         .copy-btn:hover { background: #30363d; color: #3fb950; }
         .retry-btn { color: #d29922; margin-left: 8px; }
         .retry-btn:hover { background: #30363d; color: #f0883e; }
-        .username-cell, .password-cell { display: flex; align-items: center; justify-content: space-between; gap: 6px; flex-wrap: wrap; }
-        .error-cell { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px; }
         .bottom-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 0; }
         .card { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; }
         .card-header { padding: 12px 18px; background: #0d1117; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 13px; }
@@ -535,8 +593,8 @@ HTML_UI = '''<!DOCTYPE html>
 <div id="mainContent" class="main-content">
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-crown"></i> Adjarabet Bot v26.0 | Concurrent Mode</h1>
-        <div class="header-sub">⚡ REAL CONCURRENT TABS: 3 accounts simultaneously | Stop → Start resumes</div>
+        <h1><i class="fas fa-crown"></i> Adjarabet Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
+        <div class="header-sub">🔄 Automatically restarts from beginning after each full cycle | Stop → Start resumes from current cycle</div>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
 
@@ -566,7 +624,7 @@ HTML_UI = '''<!DOCTYPE html>
         <div class="table-container">
             <table id="resultsTable">
                 <thead><tr><th onclick="sortBy('status')"><i class="fas fa-flag"></i> Status</th><th onclick="sortBy('username')"><i class="fas fa-user"></i> Username</th><th onclick="sortBy('password')"><i class="fas fa-key"></i> Password</th><th onclick="sortBy('balance')"><i class="fas fa-coins"></i> Balance</th><th>Action</th></tr></thead>
-                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</tr></tr></tbody>
+                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -576,7 +634,7 @@ HTML_UI = '''<!DOCTYPE html>
             <div class="card-header"><i class="fas fa-users"></i> Accounts Input (username:password)</div>
             <textarea id="accounts" placeholder="user1:pass123&#10;user2:pass456&#10;user3:pass789"></textarea>
             <div class="button-group">
-                <button class="btn btn-primary" onclick="startBot()"><i class="fas fa-play"></i> Start / Resume</button>
+                <button class="btn btn-primary" onclick="startBot()"><i class="fas fa-play"></i> Start Loop Mode</button>
                 <button class="btn btn-danger" onclick="stopBot()"><i class="fas fa-stop"></i> Stop</button>
                 <button class="btn btn-warning" onclick="resetBot()"><i class="fas fa-bomb"></i> Reset All</button>
                 <button class="btn btn-info" onclick="clearResultsOnly()"><i class="fas fa-eraser"></i> Clear Results</button>
@@ -586,9 +644,9 @@ HTML_UI = '''<!DOCTYPE html>
         <div class="card">
             <div class="card-header"><i class="fas fa-terminal"></i> Live Console</div>
             <div class="terminal" id="terminal">
-                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v26.0 - CONCURRENT MODE</div>
+                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v27.0 - LOOP MODE</div>
+                <div class="terminal-line"><span class="time">●</span> 🔄 Infinite loop: restarts after each full cycle!</div>
                 <div class="terminal-line"><span class="time">●</span> 💡 3 tabs open simultaneously!</div>
-                <div class="terminal-line"><span class="time">●</span> 🔄 Stop → Start resumes from EXACT position</div>
             </div>
         </div>
     </div>
@@ -651,7 +709,7 @@ async function doLogin() {
             connectWebSocket();
             await fetchResults();
             startAutoRefresh();
-            addLog('✅ Login successful');
+            addLog('✅ Login successful | LOOP MODE ACTIVE');
         } else {
             errorDiv.innerText = data.detail || 'Invalid credentials';
         }
@@ -679,8 +737,17 @@ function connectWebSocket() {
             document.getElementById('progressFill').style.width = (p[0]/p[1]*100) + '%';
         } else if (data.startsWith('SUMMARY:')) {
             addLog(data.substring(8));
+        } else if (data.startsWith('STATUS:loop_cycle_')) {
+            addLog('🔄 ' + data.substring(13).toUpperCase() + ' STARTED');
+        } else if (data.startsWith('STATUS:waiting_next_cycle:')) {
+            let sec = data.substring(24);
+            addLog(`⏳ Waiting ${sec}s before next cycle...`);
+        } else if (data.startsWith('STATUS:starting_next_cycle')) {
+            addLog('🔄 Starting next cycle...');
         } else if (data.startsWith('STATUS:completed')) {
-            addLog('Bot completed!');
+            addLog('✅ Cycle completed!');
+        } else if (data.startsWith('STATUS:loop_stopped')) {
+            addLog('⏹ Loop stopped by user');
         }
     };
 }
@@ -733,10 +800,10 @@ function addLog(msg) { let term=document.getElementById('terminal'); let div=doc
 function clearTerminal() { document.getElementById('terminal').innerHTML = ''; }
 async function copyToClipboard(text,type,btn) { await navigator.clipboard.writeText(text); let orig=btn.innerHTML; btn.innerHTML='✓'; setTimeout(()=>btn.innerHTML=orig,1000); }
 async function retryAccount(username) { addLog(`Retrying ${username}`); await fetch(`/retry/${encodeURIComponent(username)}`,{method:'POST'}); }
-async function startBot() { let acc=document.getElementById('accounts').value; if(!acc.trim()) return; await fetch('/start',{method:'POST',body:acc}); addLog('Bot started'); }
-async function stopBot() { await fetch('/stop',{method:'POST'}); addLog('Bot stopped'); }
-async function resetBot() { if(confirm('Reset all?')){ await fetch('/reset',{method:'POST'}); allResults=[]; renderResults(); updateStats(); document.getElementById('accounts').value=''; highBalanceAlerted.clear(); addLog('Reset'); } }
-async function clearResultsOnly() { if(confirm('Clear results?')){ await fetch('/clear-results',{method:'POST'}); allResults=[]; renderResults(); updateStats(); highBalanceAlerted.clear(); addLog('Cleared'); } }
+async function startBot() { let acc=document.getElementById('accounts').value; if(!acc.trim()) return; await fetch('/start',{method:'POST',body:acc}); addLog('🚀 Bot started in LOOP MODE - will run continuously!'); }
+async function stopBot() { await fetch('/stop',{method:'POST'}); addLog('⏹ Bot stopped - will not start next cycle'); }
+async function resetBot() { if(confirm('Reset all? This will stop the bot and clear all data.')){ await fetch('/reset',{method:'POST'}); allResults=[]; renderResults(); updateStats(); document.getElementById('accounts').value=''; highBalanceAlerted.clear(); addLog('🔄 Reset complete'); } }
+async function clearResultsOnly() { if(confirm('Clear results?')){ await fetch('/clear-results',{method:'POST'}); allResults=[]; renderResults(); updateStats(); highBalanceAlerted.clear(); addLog('🗑 Results cleared'); } }
 document.getElementById('accounts').value = localStorage.getItem('bot_accounts') || '';
 document.getElementById('accounts').addEventListener('input',()=>localStorage.setItem('bot_accounts',document.getElementById('accounts').value));
 document.getElementById('searchInput').addEventListener('input',()=>renderResults());
@@ -809,7 +876,7 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
     <div class="results-card">
         <div class="card-header"><h3><i class="fas fa-table-list"></i> Results</h3><input type="text" id="dashSearch" class="search-input" placeholder="Search..."><button class="refresh-btn" onclick="manualRefresh()"><i class="fas fa-sync-alt"></i></button></div>
         <div class="filter-buttons"><button class="filter-btn active" data-filter="all" onclick="setDashFilter('all')">All</button><button class="filter-btn" data-filter="success" onclick="setDashFilter('success')">✅ Success</button><button class="filter-btn" data-filter="failed" onclick="setDashFilter('failed')">❌ Failed</button><button class="filter-btn" data-filter="timeout" onclick="setDashFilter('timeout')">⏰ Timeout</button></div>
-        <div class="table-container"><table id="dashTable"><thead><tr><th onclick="sortDash('status')">Status</th><th onclick="sortDash('username')">Username</th><th onclick="sortDash('balance')">Balance</th></tr></thead><tbody id="dashTableBody"><tr><td colspan="3" style="text-align:center; padding:30px;">Loading...<tr></tr></tbody></table></div>
+        <div class="table-container"><table id="dashTable"><thead><tr><th onclick="sortDash('status')">Status</th><th onclick="sortDash('username')">Username</th><th onclick="sortDash('balance')">Balance</th></tr></thead><tbody id="dashTableBody"><tr><td colspan="3" style="text-align:center; padding:30px;">Loading...</td></tr></tbody></table></div>
     </div>
     <div class="footer"><i class="fas fa-chart-simple"></i> Auto-refresh 5s</div>
 </div>
@@ -819,7 +886,7 @@ async function verifyPin(){let pin=document.getElementById('pinInput').value;if(
 async function loadResults(){try{let res=await fetch('/results');if(res.ok){dashResults=await res.json();renderDashTable();updateDashStats();document.getElementById('lastUpdate').innerHTML='Last: '+new Date().toLocaleTimeString();}}catch(e){}}
 function startAutoRefresh(){if(refreshInterval)clearInterval(refreshInterval);refreshInterval=setInterval(loadResults,5000);}
 function manualRefresh(){loadResults();}
-function renderDashTable(){let filtered=dashResults.filter(r=>{if(dashFilter==='success'&&r.status!=='✅')return false;if(dashFilter==='failed'&&r.status!=='❌')return false;if(dashFilter==='timeout'&&r.status!=='⏰')return false;return true;});let search=document.getElementById('dashSearch')?.value.toLowerCase()||'';if(search)filtered=filtered.filter(r=>r.username.toLowerCase().includes(search));filtered.sort((a,b)=>{let av=dashSort.field==='balance'?(a.balance_value||0):(a[dashSort.field]||'').toString().toLowerCase();let bv=dashSort.field==='balance'?(b.balance_value||0):(b[dashSort.field]||'').toString().toLowerCase();if(typeof av==='number')return dashSort.dir==='asc'?av-bv:bv-av;return dashSort.dir==='asc'?(av>bv?1:-1):(av<bv?1:-1);});let balanceClass=(v)=>{let n=parseFloat(v)||0;return n>100?'balance-positive':n>10?'balance-medium':'balance-zero';};document.getElementById('dashTableBody').innerHTML=filtered.map(r=>`<tr><td style="font-size:16px">${r.status}</td><td><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username)}')"><i class="fas fa-copy"></i></button></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td></tr>`).join('');if(filtered.length===0&&dashResults.length>0)document.getElementById('dashTableBody').innerHTML='｜｜DSML｜｜<td colspan="3" style="text-align:center;padding:30px;">No results</td></tr>';}
+function renderDashTable(){let filtered=dashResults.filter(r=>{if(dashFilter==='success'&&r.status!=='✅')return false;if(dashFilter==='failed'&&r.status!=='❌')return false;if(dashFilter==='timeout'&&r.status!=='⏰')return false;return true;});let search=document.getElementById('dashSearch')?.value.toLowerCase()||'';if(search)filtered=filtered.filter(r=>r.username.toLowerCase().includes(search));filtered.sort((a,b)=>{let av=dashSort.field==='balance'?(a.balance_value||0):(a[dashSort.field]||'').toString().toLowerCase();let bv=dashSort.field==='balance'?(b.balance_value||0):(b[dashSort.field]||'').toString().toLowerCase();if(typeof av==='number')return dashSort.dir==='asc'?av-bv:bv-av;return dashSort.dir==='asc'?(av>bv?1:-1):(av<bv?1:-1);});let balanceClass=(v)=>{let n=parseFloat(v)||0;return n>100?'balance-positive':n>10?'balance-medium':'balance-zero';};document.getElementById('dashTableBody').innerHTML=filtered.map(r=>`<tr><td style="font-size:16px">${r.status}</td><td><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username)}')"><i class="fas fa-copy"></i></button></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td></tr>`).join('');if(filtered.length===0&&dashResults.length>0)document.getElementById('dashTableBody').innerHTML='<tr><td colspan="3" style="text-align:center;padding:30px;">No results</td></tr>';}
 function updateDashStats(){document.getElementById('dashTotal').innerText=dashResults.length;document.getElementById('dashSuccess').innerText=dashResults.filter(r=>r.status==='✅').length;document.getElementById('dashFailed').innerText=dashResults.filter(r=>r.status==='❌').length;document.getElementById('dashTimeout').innerText=dashResults.filter(r=>r.status==='⏰').length;}
 function setDashFilter(filter){dashFilter=filter;document.querySelectorAll('.filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.filter===filter));renderDashTable();}
 function sortDash(field){if(dashSort.field===field)dashSort.dir=dashSort.dir==='asc'?'desc':'asc';else{dashSort.field=field;dashSort.dir='desc';}renderDashTable();}
@@ -831,7 +898,7 @@ document.getElementById('pinInput').addEventListener('keypress',(e)=>{if(e.key==
 </body>
 </html>'''
 
-# ================= MOBILE UI (Միայն Username, Password, Balance + Refresh + SORT by Balance DESC) =================
+# ================= MOBILE UI =================
 MOBILE_HTML = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
@@ -904,12 +971,11 @@ MOBILE_HTML = '''<!DOCTYPE html>
 <script>
 let mobileResults = [], refreshInterval = null;
 
-// 🆕 Բալանսի մեծից փոքր տեսակավորում (DESC)
 function sortByBalanceDesc(data) {
     return [...data].sort((a, b) => {
         const balanceA = parseFloat(a.balance_value) || 0;
         const balanceB = parseFloat(b.balance_value) || 0;
-        return balanceB - balanceA; // մեծից փոքր
+        return balanceB - balanceA;
     });
 }
 
@@ -941,7 +1007,6 @@ async function loadResults() {
         const res = await fetch('/results');
         if(res.ok) {
             const data = await res.json();
-            // 🆕 Տեսակավորում ենք բալանսի մեծից փոքր
             mobileResults = sortByBalanceDesc(data);
             renderMobileList();
             document.getElementById('lastUpdate').innerHTML = 'Last: '+new Date().toLocaleTimeString();
@@ -1001,12 +1066,13 @@ document.getElementById('pinInput').addEventListener('keypress', (e) => { if(e.k
 async def lifespan(app: FastAPI):
     await bot.init()
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT v26.0 - CONCURRENT MODE")
+    logger.info("🎮 ADJARABET BOT v27.0 - LOOP MODE")
     logger.info(f"📍 Host: {CONFIG['host']}:{CONFIG['port']}")
     logger.info(f"⚡ REAL Concurrent tabs: {CONFIG['concurrent_limit']}")
+    logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'}")
+    logger.info(f"⏱ Loop delay: {CONFIG['loop_delay']}s between cycles")
     logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
-    logger.info("✅ Stop → Start resumes from EXACT position")
-    logger.info("✅ Each account gets INDEPENDENT browser tab")
+    logger.info("✅ Bot will continuously restart from beginning after each full cycle")
     logger.info(f"🔐 Main Auth: {AUTH_USERNAME} / {AUTH_PASSWORD[:3]}***")
     logger.info(f"🔐 Dashboard PIN: {DASHBOARD_PIN}")
     logger.info(f"🔐 Mobile PIN: {MOBILE_PIN}")
@@ -1014,7 +1080,7 @@ async def lifespan(app: FastAPI):
     yield
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot Concurrent", version="26.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot Loop Mode", version="27.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -1045,7 +1111,7 @@ async def start_bot(req: Request):
         await asyncio.sleep(0.5)
     
     processing_task = asyncio.create_task(bot.start(accounts, manager))
-    return {"status": "started", "total": len(accounts)}
+    return {"status": "started", "total": len(accounts), "loop_mode": CONFIG["loop_mode"]}
 
 @app.post("/stop")
 async def stop_bot():
@@ -1087,7 +1153,8 @@ async def health():
         "current_index": bot.current_index, 
         "total": len(bot.all_accounts), 
         "total_processed": len(bot.results),
-        "concurrent_limit": CONFIG["concurrent_limit"]
+        "concurrent_limit": CONFIG["concurrent_limit"],
+        "loop_mode": CONFIG["loop_mode"]
     }
 
 @app.websocket("/ws")
@@ -1144,7 +1211,7 @@ if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
     print("\n" + "=" * 60)
-    print("🎮 ADJARABET BOT v26.0 - CONCURRENT MODE")
+    print("🎮 ADJARABET BOT v27.0 - LOOP MODE")
     print("=" * 60)
     print(f"📍 Main UI: http://{CONFIG['host']}:{CONFIG['port']}")
     print(f"📍 Dashboard: http://{CONFIG['host']}:{CONFIG['port']}/dashboard")
@@ -1154,5 +1221,7 @@ if __name__ == "__main__":
     print(f"🔐 Mobile PIN: {MOBILE_PIN}")
     print(f"🔧 Headless: {CONFIG['headless']}")
     print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
+    print(f"🔄 LOOP MODE: ON - Bot will restart from beginning after each full cycle!")
+    print(f"⏱ Delay between cycles: {CONFIG['loop_delay']} seconds")
     print("=" * 60 + "\n")
     uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], log_level="warning", access_log=False)
