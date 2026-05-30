@@ -75,10 +75,10 @@ CONFIG = {
     "timeout_nav": int(os.getenv("TIMEOUT_NAV", 15000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 2)),
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
-    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",
-    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),
+    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",  # NEW: անվերջ ցիկլ
+    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),  # NEW: դադար ցիկլերի արանքում
 }
 
 logging.basicConfig(
@@ -86,7 +86,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-logger = logging.getLogger("VbetBot")
+logger = logging.getLogger("AdjarabetBot")
 
 class AccountStatus(Enum):
     SUCCESS = "✅"
@@ -165,7 +165,7 @@ class Bot:
         self._running = False
         self._stop_flag = False
         self._processing_task: Optional[asyncio.Task] = None
-        self._loop_task: Optional[asyncio.Task] = None
+        self._loop_task: Optional[asyncio.Task] = None  # NEW: loop task
 
     async def init(self):
         logger.info("Starting browser...")
@@ -205,7 +205,7 @@ class Bot:
 
     def _parse_balance(self, text: str) -> tuple:
         try:
-            text = text.replace(',', '').replace('֏', '').replace('AMD', '').strip()
+            text = text.replace(',', '').replace('֏', '').replace('GEL', '').replace('₾', '').strip()
             m = re.search(r'(\d+(?:\.\d+)?)', text)
             if m:
                 val = float(m.group(1))
@@ -234,12 +234,11 @@ class Bot:
                 if not self._running or self._stop_flag:
                     return acc
                 try:
-                    await page.goto('https://www.vbet.am/hy', wait_until='domcontentloaded')
-                    await asyncio.sleep(1.5)
+                    await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
+                    await asyncio.sleep(0.5)
                     
-                    # Check if already logged in by looking for balance
                     try:
-                        bal_el = await page.wait_for_selector('p.balanceAmount', timeout=3000)
+                        bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2000)
                         if bal_el:
                             txt = await bal_el.inner_text()
                             acc.balance, acc.balance_value = self._parse_balance(txt)
@@ -249,38 +248,11 @@ class Bot:
                     except:
                         pass
                     
-                    # Click on "Մուտք" button (span with text)
-                    try:
-                        login_span = await page.wait_for_selector('span:has-text("Մուտք")', timeout=3000)
-                        if login_span:
-                            await login_span.click()
-                            await asyncio.sleep(0.8)
-                    except:
-                        # Fallback: try button
-                        try:
-                            await page.click('button:has-text("Մուտք")', timeout=2000)
-                            await asyncio.sleep(0.5)
-                        except:
-                            pass
+                    await page.fill('input[name="userIdentifier"]', acc.username, timeout=CONFIG["timeout_element"])
+                    await page.fill('input[type="password"]', acc.password, timeout=CONFIG["timeout_element"])
+                    await page.click('[data-test-id="header-login-button"]')
                     
-                    # Fill username (class="form-control-input-bc" name="username")
-                    await page.fill('input[name="username"]', acc.username, timeout=CONFIG["timeout_element"])
-                    
-                    # Fill password (class="form-control-input-bc" name="password")
-                    await page.fill('input[name="password"]', acc.password, timeout=CONFIG["timeout_element"])
-                    
-                    # Click submit button (the same "Մուտք" span after filling)
-                    try:
-                        submit_span = await page.wait_for_selector('span:has-text("Մուտք")', timeout=CONFIG["timeout_element"])
-                        if submit_span:
-                            await submit_span.click()
-                        else:
-                            await page.click('button:has-text("Մուտք")', timeout=CONFIG["timeout_element"])
-                    except:
-                        await page.keyboard.press("Enter")
-                    
-                    # Wait for balance to appear
-                    bal_el = await page.wait_for_selector('p.balanceAmount', timeout=CONFIG["timeout_nav"])
+                    bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=CONFIG["timeout_nav"])
                     txt = await bal_el.inner_text()
                     acc.balance, acc.balance_value = self._parse_balance(txt)
                     acc.status = AccountStatus.SUCCESS
@@ -334,6 +306,7 @@ class Bot:
             return result
 
     async def _run_one_cycle(self, accounts: List[Account], manager: ConnectionManager) -> bool:
+        """Execute one full cycle of all accounts. Returns True if completed normally."""
         self.all_accounts = accounts.copy()
         self.results = []
         self.current_index = 0
@@ -384,20 +357,24 @@ class Bot:
         return False
 
     async def start(self, accounts: List[Account], manager: ConnectionManager):
+        """Start bot - runs in loop mode if enabled"""
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
             await asyncio.sleep(0.5)
         
         if CONFIG["loop_mode"]:
+            # NEW: Infinite loop mode
             self._loop_task = asyncio.create_task(self._run_loop(accounts, manager))
             logger.info(f"▶ LOOP MODE STARTED - will run continuously")
             await manager.broadcast("STATUS:loop_mode_started")
         else:
+            # Single run mode (original behavior)
             self._processing_task = asyncio.create_task(self._run_one_cycle(accounts, manager))
             logger.info(f"▶ SINGLE RUN MODE - will stop after one cycle")
             await manager.broadcast("STATUS:started")
 
     async def _run_loop(self, original_accounts: List[Account], manager: ConnectionManager):
+        """Infinite loop: repeatedly process all accounts"""
         cycle_number = 0
         self._running = True
         
@@ -406,8 +383,10 @@ class Bot:
             logger.info(f"🔄 ===== LOOP CYCLE #{cycle_number} STARTING =====")
             await manager.broadcast(f"STATUS:loop_cycle_{cycle_number}")
             
+            # Create fresh copy of accounts for this cycle
             accounts_copy = [Account(acc.username, acc.password) for acc in original_accounts]
             
+            # Run one cycle
             completed = await self._run_one_cycle(accounts_copy, manager)
             
             if not self._running or self._stop_flag:
@@ -419,6 +398,7 @@ class Bot:
                 logger.info(f"✅ Cycle #{cycle_number} completed. Waiting {CONFIG['loop_delay']}s before next cycle...")
                 await manager.broadcast(f"STATUS:waiting_next_cycle:{CONFIG['loop_delay']}")
                 
+                # Wait before next cycle
                 for _ in range(int(CONFIG['loop_delay'])):
                     if self._stop_flag or not self._running:
                         break
@@ -507,13 +487,13 @@ async def retry_single_account(acc: Account):
         logger.error(f"Retry failed for {acc.username}: {e}")
         return None
 
-# ================= MAIN UI (ADJARABET DESIGN - UNCHANGED, PERFECT) =================
+# ================= MAIN UI =================
 HTML_UI = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Vbetbot Bot | LOOP MODE v27.0</title>
+    <title>Adjarabet Bot | LOOP MODE v27.0</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -613,7 +593,7 @@ HTML_UI = '''<!DOCTYPE html>
 <div id="mainContent" class="main-content">
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-crown"></i> Vbet Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
+        <h1><i class="fas fa-crown"></i> Adjarabet Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
         <div class="header-sub">🔄 Automatically restarts from beginning after each full cycle | Stop → Start resumes from current cycle</div>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
@@ -831,7 +811,7 @@ document.getElementById('searchInput').addEventListener('input',()=>renderResult
 </body>
 </html>'''
 
-# ================= DASHBOARD UI (UNCHANGED) =================
+# ================= DASHBOARD UI =================
 DASHBOARD_HTML = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
@@ -918,7 +898,7 @@ document.getElementById('pinInput').addEventListener('keypress',(e)=>{if(e.key==
 </body>
 </html>'''
 
-# ================= MOBILE UI (UNCHANGED) =================
+# ================= MOBILE UI =================
 MOBILE_HTML = '''<!DOCTYPE html>
 <html lang="hy">
 <head>
@@ -1086,7 +1066,7 @@ document.getElementById('pinInput').addEventListener('keypress', (e) => { if(e.k
 async def lifespan(app: FastAPI):
     await bot.init()
     logger.info("=" * 50)
-    logger.info("🎮 VBET BOT v27.0 - LOOP MODE (VBET TARGET)")
+    logger.info("🎮 ADJARABET BOT v27.0 - LOOP MODE")
     logger.info(f"📍 Host: {CONFIG['host']}:{CONFIG['port']}")
     logger.info(f"⚡ REAL Concurrent tabs: {CONFIG['concurrent_limit']}")
     logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'}")
@@ -1100,7 +1080,7 @@ async def lifespan(app: FastAPI):
     yield
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot Loop Mode (VBET)", version="27.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot Loop Mode", version="27.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -1231,7 +1211,7 @@ if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
     print("\n" + "=" * 60)
-    print("🎮 ADJARABET BOT v27.0 - LOOP MODE (VBET TARGET)")
+    print("🎮 ADJARABET BOT v27.0 - LOOP MODE")
     print("=" * 60)
     print(f"📍 Main UI: http://{CONFIG['host']}:{CONFIG['port']}")
     print(f"📍 Dashboard: http://{CONFIG['host']}:{CONFIG['port']}/dashboard")
