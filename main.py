@@ -75,7 +75,7 @@ CONFIG = {
     "timeout_nav": int(os.getenv("TIMEOUT_NAV", 15000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
-    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
+    "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 1)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
     "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",  # NEW: անվերջ ցիկլ
     "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),  # NEW: դադար ցիկլերի արանքում
