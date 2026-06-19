@@ -74,11 +74,11 @@ CONFIG = {
     "headless": os.getenv("HEADLESS", "True").lower() == "true",
     "timeout_nav": int(os.getenv("TIMEOUT_NAV", 15000)),
     "timeout_element": int(os.getenv("TIMEOUT_ELEMENT", 5000)),
-    "max_retries": int(os.getenv("MAX_RETRIES", 1)),
+    "max_retries": int(os.getenv("MAX_RETRIES", 0)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
-    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",  # NEW: անվերջ ցիկլ
-    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),  # NEW: դադար ցիկլերի արանքում
+    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",
+    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),
 }
 
 logging.basicConfig(
@@ -104,6 +104,18 @@ class Account:
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
     
     def to_dict(self) -> Dict:
+        """⚠️ SECURE: Returns data WITHOUT password!"""
+        return {
+            "username": self.username,
+            "balance": self.balance,
+            "balance_value": self.balance_value,
+            "status": self.status.value,
+            "error": self.error[:80],
+            "timestamp": self.timestamp
+        }
+    
+    def to_dict_with_password(self) -> Dict:
+        """⚠️ INTERNAL ONLY: Returns data WITH password (for retry)"""
         return {
             "username": self.username,
             "password": self.password,
@@ -165,7 +177,7 @@ class Bot:
         self._running = False
         self._stop_flag = False
         self._processing_task: Optional[asyncio.Task] = None
-        self._loop_task: Optional[asyncio.Task] = None  # NEW: loop task
+        self._loop_task: Optional[asyncio.Task] = None
 
     async def init(self):
         logger.info("Starting browser...")
@@ -177,13 +189,60 @@ class Bot:
                 '--disable-setuid-sandbox', 
                 '--disable-dev-shm-usage', 
                 '--disable-gpu',
-                '--disable-blink-features=AutomationControlled'
+                '--disable-blink-features=AutomationControlled',
+                '--disable-features=IsolateOrigins,site-per-process',
+                '--disable-web-security',
+                '--disable-features=BlockInsecurePrivateNetworkRequests',
+                '--disable-features=OutOfBlinkCors',
+                '--disable-blink-features=AutomationControlled',
+                '--disable-component-extensions-with-background-pages',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-plugins',
+                '--disable-translate',
+                '--disable-sync',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-features=TranslateUI',
+                '--disable-ipc-flooding-protection',
+                '--disable-features=RendererCodeIntegrity',
+                '--disable-features=ChromeWhatsNewUI',
+                '--disable-features=OmniboxRichEntitySuggestions',
+                '--disable-features=MediaRouter',
+                '--disable-features=OptimizationGuideModelDownloading',
+                '--disable-features=OptimizationHints',
+                '--disable-features=OptimizationTargetPrediction',
+                '--disable-features=PageContentAnnotations',
+                '--disable-features=PasswordImport',
+                '--disable-features=PrivacySandboxSettings4',
+                '--disable-features=PrivacySandboxSettings3',
+                '--disable-features=PromptApi',
+                '--disable-features=ReadAnything',
+                '--disable-features=RelatedWebsiteSets',
+                '--disable-features=SafetyHub',
+                '--disable-features=SearchEngineChoiceScreen',
+                '--disable-features=SegmentationPlatform',
+                '--disable-features=SidePanelPinnable',
+                '--disable-features=SiteIsolationForPasswordSites',
+                '--disable-features=Spellchecking',
+                '--disable-features=SubresourceFilter',
+                '--disable-features=SyncSessions',
+                '--disable-features=Translate',
+                '--disable-features=WebAuthn',
+                '--disable-features=WebOTP',
+                '--disable-features=WebPayments',
+                '--disable-features=WebUsb',
+                '--disable-features=WebXr',
+                '--disable-features=WinSspi',
+                '--disable-features=ZeroCopy',
+                '--disable-features=SuppressDifferentOriginSubframeJSDialogs'
             ]
         )
         self.semaphore = asyncio.Semaphore(CONFIG["concurrent_limit"])
         self._running = True
         logger.info(f"✓ Browser ready | Concurrent tabs: {CONFIG['concurrent_limit']}")
-        logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'} (will restart from beginning after completion)")
+        logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'}")
         return True
 
     async def cleanup(self):
@@ -224,9 +283,24 @@ class Bot:
             
             ctx = await self.browser.new_context(
                 viewport={'width': 1280, 'height': 720},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                ignore_https_errors=True
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                ignore_https_errors=True,
+                # 🚀 CRITICAL: Disable CSS and other resources for speed
+                extra_http_headers={
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'no-cache',
+                    'Pragma': 'no-cache'
+                }
             )
+            
+            # 🚀 CRITICAL: Block CSS, fonts, images, and other non-essential resources
+            await ctx.route("**/*", lambda route: route.continue_() if route.request.resource_type in ["document", "xhr", "fetch", "websocket"] else route.abort())
+            
+            # 🚀 Also block specific resource types using another method
+            await ctx.route("**/*", lambda route: route.abort() if route.request.resource_type in ["stylesheet", "font", "image", "media", "manifest", "other", "ping", "csp_report", "preflight", "eventsource"] else route.continue_())
+            
             page = await ctx.new_page()
             page.set_default_timeout(CONFIG["timeout_nav"])
             
@@ -234,8 +308,9 @@ class Bot:
                 if not self._running or self._stop_flag:
                     return acc
                 try:
-                    await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded')
-                    await asyncio.sleep(0.5)
+                    # 🚀 Navigate with minimal resource loading
+                    await page.goto('https://www.adjarabet.am/hy', wait_until='domcontentloaded', timeout=CONFIG["timeout_nav"])
+                    await asyncio.sleep(0.3)
                     
                     try:
                         bal_el = await page.wait_for_selector('[data-test-id="header-user-balance"]', timeout=2000)
@@ -301,12 +376,12 @@ class Bot:
             result = await self._login_one(acc, worker_id)
             self.results.append(result)
             self.current_index += 1
+            # ⚠️ Send WITHOUT password!
             await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
             await manager.broadcast(f"PROGRESS:{self.current_index}/{len(self.all_accounts)}")
             return result
 
     async def _run_one_cycle(self, accounts: List[Account], manager: ConnectionManager) -> bool:
-        """Execute one full cycle of all accounts. Returns True if completed normally."""
         self.all_accounts = accounts.copy()
         self.results = []
         self.current_index = 0
@@ -357,24 +432,20 @@ class Bot:
         return False
 
     async def start(self, accounts: List[Account], manager: ConnectionManager):
-        """Start bot - runs in loop mode if enabled"""
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
             await asyncio.sleep(0.5)
         
         if CONFIG["loop_mode"]:
-            # NEW: Infinite loop mode
             self._loop_task = asyncio.create_task(self._run_loop(accounts, manager))
-            logger.info(f"▶ LOOP MODE STARTED - will run continuously")
+            logger.info(f"▶ LOOP MODE STARTED")
             await manager.broadcast("STATUS:loop_mode_started")
         else:
-            # Single run mode (original behavior)
             self._processing_task = asyncio.create_task(self._run_one_cycle(accounts, manager))
-            logger.info(f"▶ SINGLE RUN MODE - will stop after one cycle")
+            logger.info(f"▶ SINGLE RUN MODE")
             await manager.broadcast("STATUS:started")
 
     async def _run_loop(self, original_accounts: List[Account], manager: ConnectionManager):
-        """Infinite loop: repeatedly process all accounts"""
         cycle_number = 0
         self._running = True
         
@@ -383,10 +454,8 @@ class Bot:
             logger.info(f"🔄 ===== LOOP CYCLE #{cycle_number} STARTING =====")
             await manager.broadcast(f"STATUS:loop_cycle_{cycle_number}")
             
-            # Create fresh copy of accounts for this cycle
             accounts_copy = [Account(acc.username, acc.password) for acc in original_accounts]
             
-            # Run one cycle
             completed = await self._run_one_cycle(accounts_copy, manager)
             
             if not self._running or self._stop_flag:
@@ -395,10 +464,9 @@ class Bot:
                 break
             
             if completed and CONFIG["loop_mode"]:
-                logger.info(f"✅ Cycle #{cycle_number} completed. Waiting {CONFIG['loop_delay']}s before next cycle...")
+                logger.info(f"✅ Cycle #{cycle_number} completed. Waiting {CONFIG['loop_delay']}s...")
                 await manager.broadcast(f"STATUS:waiting_next_cycle:{CONFIG['loop_delay']}")
                 
-                # Wait before next cycle
                 for _ in range(int(CONFIG['loop_delay'])):
                     if self._stop_flag or not self._running:
                         break
@@ -435,29 +503,71 @@ class Bot:
         logger.info("🗑 Results cleared")
 
     async def _save_results(self):
+        """⚠️ Save WITHOUT passwords!"""
         try:
             Path("results").mkdir(exist_ok=True)
-            data = [r.to_dict() for r in self.results]
+            data = [r.to_dict() for r in self.results]  # NO passwords!
             async with aiofiles.open("results/results.json", "w", encoding="utf-8") as f:
                 await f.write(json.dumps(data, indent=2, ensure_ascii=False))
         except Exception as e:
             logger.error(f"Save error: {e}")
 
     async def get_results(self) -> List[Dict]:
+        """Return results WITHOUT passwords!"""
         if self.results:
-            return [r.to_dict() for r in self.results]
+            return [r.to_dict() for r in self.results]  # NO passwords!
         try:
             p = Path("results/results.json")
             if p.exists():
                 async with aiofiles.open(p, "r", encoding="utf-8") as f:
-                    return json.loads(await f.read())
+                    return json.loads(await f.read())  # File has NO passwords
         except:
             pass
         return []
 
+    def get_account_by_username(self, username: str) -> Optional[Account]:
+        """Internal: get account with password (for retry only)"""
+        for acc in self.results:
+            if acc.username == username:
+                return acc
+        return None
+
 manager = ConnectionManager()
 bot = Bot()
 processing_task: Optional[asyncio.Task] = None
+
+# ================= AUTH DEPENDENCY FOR ALL API ENDPOINTS =================
+async def verify_api_auth(request: Request):
+    """All API endpoints require Basic Authentication"""
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Basic "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing authentication",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    
+    try:
+        import base64
+        encoded = auth_header[6:]
+        decoded = base64.b64decode(encoded).decode('utf-8')
+        username, password = decoded.split(':', 1)
+    except:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    
+    correct_username = secrets.compare_digest(username, AUTH_USERNAME)
+    correct_password = secrets.compare_digest(password, AUTH_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return username
 
 async def retry_single_account(acc: Account):
     try:
@@ -480,6 +590,7 @@ async def retry_single_account(acc: Account):
                 break
         
         await bot._save_results()
+        # ⚠️ Send WITHOUT password!
         await manager.broadcast(f"RESULT:{json.dumps(result.to_dict())}")
         logger.info(f"🔄 Retry completed for {result.username}: {result.status.value}")
         return result
@@ -493,7 +604,7 @@ HTML_UI = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adjarabet Bot | LOOP MODE v27.0</title>
+    <title>Adjarabet Bot | LOOP MODE v28.0</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -519,7 +630,6 @@ HTML_UI = '''<!DOCTYPE html>
         .stat-card:hover { transform: translateY(-1px); border-color: #58a6ff; background: #1a1f2e; }
         .stat-number { font-size: 22px; font-weight: 700; color: #58a6ff; }
         .stat-label { font-size: 10px; color: #8b949e; margin-top: 3px; font-weight: 500; }
-        .cycle-info { font-size: 11px; color: #d29922; margin-top: 5px; }
         .results-section { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; margin-bottom: 20px; }
         .section-header { padding: 14px 20px; background: #0d1117; border-bottom: 1px solid #30363d; font-weight: 600; font-size: 15px; }
         .section-header i { color: #58a6ff; margin-right: 8px; }
@@ -593,8 +703,8 @@ HTML_UI = '''<!DOCTYPE html>
 <div id="mainContent" class="main-content">
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-crown"></i> Adjarabet Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
-        <div class="header-sub">🔄 Automatically restarts from beginning after each full cycle | Stop → Start resumes from current cycle</div>
+        <h1><i class="fas fa-crown"></i> Adjarabet Bot v28.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
+        <div class="header-sub">🔄 Automatically restarts from beginning after each full cycle | 🔒 Passwords NEVER exposed</div>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
 
@@ -623,8 +733,8 @@ HTML_UI = '''<!DOCTYPE html>
         </div>
         <div class="table-container">
             <table id="resultsTable">
-                <thead><tr><th onclick="sortBy('status')"><i class="fas fa-flag"></i> Status</th><th onclick="sortBy('username')"><i class="fas fa-user"></i> Username</th><th onclick="sortBy('password')"><i class="fas fa-key"></i> Password</th><th onclick="sortBy('balance')"><i class="fas fa-coins"></i> Balance</th><th>Action</th></tr></thead>
-                <tbody id="resultsBody"><tr><td colspan="5" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</td></tr></tbody>
+                <thead><tr><th onclick="sortBy('status')"><i class="fas fa-flag"></i> Status</th><th onclick="sortBy('username')"><i class="fas fa-user"></i> Username</th><th onclick="sortBy('balance')"><i class="fas fa-coins"></i> Balance</th><th>Action</th></tr></thead>
+                <tbody id="resultsBody"><tr><td colspan="4" style="text-align:center; padding:40px;"><i class="fas fa-spinner fa-pulse"></i> Waiting...</td></tr></tbody>
             </table>
         </div>
     </div>
@@ -644,9 +754,10 @@ HTML_UI = '''<!DOCTYPE html>
         <div class="card">
             <div class="card-header"><i class="fas fa-terminal"></i> Live Console</div>
             <div class="terminal" id="terminal">
-                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v27.0 - LOOP MODE</div>
+                <div class="terminal-line"><span class="time">●</span> 🚀 Bot ready v28.0 - LOOP MODE</div>
                 <div class="terminal-line"><span class="time">●</span> 🔄 Infinite loop: restarts after each full cycle!</div>
                 <div class="terminal-line"><span class="time">●</span> 💡 3 tabs open simultaneously!</div>
+                <div class="terminal-line"><span class="time">●</span> 🔒 PASSWORDS ARE NEVER EXPOSED!</div>
             </div>
         </div>
     </div>
@@ -656,6 +767,7 @@ HTML_UI = '''<!DOCTYPE html>
 <script>
 let ws = null, allResults = [], currentFilter = 'all', currentBalanceFilter = 'all', currentSort = { field: 'balance', dir: 'desc' };
 let wsToken = null;
+let authHeader = null;
 let highBalanceAlerted = new Set();
 
 function playHighBalanceSound() {
@@ -697,9 +809,12 @@ async function doLogin() {
     const errorDiv = document.getElementById('loginError');
     if(!username || !password) { errorDiv.innerText = 'Enter credentials'; return; }
     try {
+        const b64 = btoa(username + ':' + password);
+        authHeader = 'Basic ' + b64;
+        
         const res = await fetch('/token', {
             method: 'POST',
-            headers: { 'Authorization': 'Basic ' + btoa(username + ':' + password) }
+            headers: { 'Authorization': authHeader }
         });
         const data = await res.json();
         if(res.ok && data.token) {
@@ -753,9 +868,22 @@ function connectWebSocket() {
 }
 
 async function fetchResults() {
-    try { const res = await fetch('/results'); if(res.ok) { allResults = await res.json(); renderResults(); updateStats(); } } catch(e) {}
+    try {
+        const res = await fetch('/results', {
+            headers: { 'Authorization': authHeader }
+        });
+        if(res.ok) {
+            allResults = await res.json();
+            renderResults();
+            updateStats();
+        }
+    } catch(e) {}
 }
-function startAutoRefresh() { setInterval(fetchResults, 5000); }
+
+function startAutoRefresh() { 
+    setInterval(fetchResults, 5000); 
+}
+
 function renderResults() {
     let filtered = allResults.filter(r => {
         if(currentFilter !== 'all') {
@@ -780,30 +908,106 @@ function renderResults() {
         return currentSort.dir === 'asc' ? (av > bv ? 1 : -1) : (av < bv ? 1 : -1);
     });
     let balanceClass = (v) => { let n = parseFloat(v)||0; return n>100?'balance-positive':n>10?'balance-medium':'balance-zero'; };
-    document.getElementById('resultsBody').innerHTML = filtered.map(r => `<tr><td style="font-size:18px">${r.status}</td><td><div class="username-cell"><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username)}','username',this)"><i class="fas fa-copy"></i></button></div></td><td><div class="password-cell">${escapeHtml(r.password)}<button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.password)}','password',this)"><i class="fas fa-key"></i></button></div></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td><td class="error-cell">${escapeHtml(r.error||'-')}<button class="retry-btn" onclick="retryAccount('${escapeHtml(r.username)}')"><i class="fas fa-sync-alt"></i> Retry</button></div></td></tr>`).join('');
+    document.getElementById('resultsBody').innerHTML = filtered.map(r => `<tr><td style="font-size:18px">${r.status}</td><td><div class="username-cell"><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username)}','username',this)"><i class="fas fa-copy"></i></button></div></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td><td class="error-cell">${escapeHtml(r.error||'-')}<button class="retry-btn" onclick="retryAccount('${escapeHtml(r.username)}')"><i class="fas fa-sync-alt"></i> Retry</button></td></tr>`).join('');
 }
+
 function updateStats() {
     document.getElementById('totalCount').innerText = allResults.length;
     document.getElementById('successCount').innerText = allResults.filter(r=>r.status==='✅').length;
     document.getElementById('failedCount').innerText = allResults.filter(r=>r.status==='❌').length;
     document.getElementById('timeoutCount').innerText = allResults.filter(r=>r.status==='⏰').length;
 }
+
 function sortBy(field) {
     if(currentSort.field === field) currentSort.dir = currentSort.dir==='asc'?'desc':'asc';
     else { currentSort.field = field; currentSort.dir = field==='balance'?'desc':'asc'; }
     renderResults();
 }
+
 function setFilter(f) { currentFilter = f; document.querySelectorAll('.filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.filter===f)); renderResults(); }
+
 function setBalanceFilter(f) { currentBalanceFilter = f; document.querySelectorAll('.balance-filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.balance===f)); renderResults(); }
+
 function escapeHtml(s) { if(!s) return ''; return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]); }
+
 function addLog(msg) { let term=document.getElementById('terminal'); let div=document.createElement('div'); div.className='terminal-line'; div.innerHTML=`<span class="time">[${new Date().toLocaleTimeString()}]</span> ${msg}`; term.appendChild(div); if(term.children.length>100) term.removeChild(term.firstChild); }
+
 function clearTerminal() { document.getElementById('terminal').innerHTML = ''; }
+
 async function copyToClipboard(text,type,btn) { await navigator.clipboard.writeText(text); let orig=btn.innerHTML; btn.innerHTML='✓'; setTimeout(()=>btn.innerHTML=orig,1000); }
-async function retryAccount(username) { addLog(`Retrying ${username}`); await fetch(`/retry/${encodeURIComponent(username)}`,{method:'POST'}); }
-async function startBot() { let acc=document.getElementById('accounts').value; if(!acc.trim()) return; await fetch('/start',{method:'POST',body:acc}); addLog('🚀 Bot started in LOOP MODE - will run continuously!'); }
-async function stopBot() { await fetch('/stop',{method:'POST'}); addLog('⏹ Bot stopped - will not start next cycle'); }
-async function resetBot() { if(confirm('Reset all? This will stop the bot and clear all data.')){ await fetch('/reset',{method:'POST'}); allResults=[]; renderResults(); updateStats(); document.getElementById('accounts').value=''; highBalanceAlerted.clear(); addLog('🔄 Reset complete'); } }
-async function clearResultsOnly() { if(confirm('Clear results?')){ await fetch('/clear-results',{method:'POST'}); allResults=[]; renderResults(); updateStats(); highBalanceAlerted.clear(); addLog('🗑 Results cleared'); } }
+
+async function retryAccount(username) {
+    addLog(`Retrying ${username}`);
+    try {
+        await fetch(`/retry/${encodeURIComponent(username)}`, {
+            method: 'POST',
+            headers: { 'Authorization': authHeader }
+        });
+    } catch(e) {
+        addLog('❌ Retry failed: ' + e.message);
+    }
+}
+
+async function startBot() {
+    let acc = document.getElementById('accounts').value;
+    if(!acc.trim()) return;
+    try {
+        await fetch('/start', {
+            method: 'POST',
+            body: acc,
+            headers: { 'Authorization': authHeader }
+        });
+        addLog('🚀 Bot started in LOOP MODE - will run continuously!');
+    } catch(e) {
+        addLog('❌ Start failed: ' + e.message);
+    }
+}
+
+async function stopBot() {
+    try {
+        await fetch('/stop', {
+            method: 'POST',
+            headers: { 'Authorization': authHeader }
+        });
+        addLog('⏹ Bot stopped - will not start next cycle');
+    } catch(e) {
+        addLog('❌ Stop failed: ' + e.message);
+    }
+}
+
+async function resetBot() {
+    if(confirm('Reset all? This will stop the bot and clear all data.')){
+        try {
+            await fetch('/reset', {
+                method: 'POST',
+                headers: { 'Authorization': authHeader }
+            });
+            allResults=[]; renderResults(); updateStats(); 
+            document.getElementById('accounts').value=''; 
+            highBalanceAlerted.clear(); 
+            addLog('🔄 Reset complete');
+        } catch(e) {
+            addLog('❌ Reset failed: ' + e.message);
+        }
+    }
+}
+
+async function clearResultsOnly() {
+    if(confirm('Clear results?')){
+        try {
+            await fetch('/clear-results', {
+                method: 'POST',
+                headers: { 'Authorization': authHeader }
+            });
+            allResults=[]; renderResults(); updateStats(); 
+            highBalanceAlerted.clear(); 
+            addLog('🗑 Results cleared');
+        } catch(e) {
+            addLog('❌ Clear failed: ' + e.message);
+        }
+    }
+}
+
 document.getElementById('accounts').value = localStorage.getItem('bot_accounts') || '';
 document.getElementById('accounts').addEventListener('input',()=>localStorage.setItem('bot_accounts',document.getElementById('accounts').value));
 document.getElementById('searchInput').addEventListener('input',()=>renderResults());
@@ -928,7 +1132,6 @@ MOBILE_HTML = '''<!DOCTYPE html>
         .account-row:last-child { border-bottom: none; }
         .label { font-size: 9px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
         .username-value { font-size: 14px; font-weight: 600; color: #58a6ff; word-break: break-all; }
-        .password-value { font-size: 12px; font-family: monospace; color: #e6edf3; word-break: break-all; }
         .balance-value { font-size: 16px; font-weight: 700; }
         .balance-positive { color: #3fb950; }
         .balance-medium { color: #d29922; }
@@ -1047,7 +1250,6 @@ function renderMobileList() {
         const safeId = acc.username.replace(/[^a-zA-Z0-9]/g, '_');
         return `<div class="account-card">
             <div class="account-row"><div class="row-header"><span class="status-badge">${acc.status}</span><span class="username-value"><strong>${escapeHtml(acc.username)}</strong></span><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(acc.username)}', this)"><i class="fas fa-copy"></i></button></div><button class="refresh-row-btn" id="refresh-btn-${safeId}" onclick="refreshSingleAccount('${escapeHtml(acc.username)}')"><i class="fas fa-sync-alt"></i> Refresh</button></div>
-            <div class="account-row"><div style="flex:1"><div class="label"><i class="fas fa-key"></i> Password</div><div class="password-value">${escapeHtml(acc.password)} <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(acc.password)}', this)"><i class="fas fa-copy"></i></button></div></div></div>
             <div class="account-row"><div style="flex:1"><div class="label"><i class="fas fa-coins"></i> Balance</div><div class="balance-value ${balanceClass(acc.balance_value)}">${acc.balance || '0 ֏'}</div></div></div>
             ${acc.error ? `<div class="account-row"><div class="error-text"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(acc.error)}</div></div>` : ''}
         </div>`;
@@ -1064,37 +1266,58 @@ document.getElementById('pinInput').addEventListener('keypress', (e) => { if(e.k
 # ================= FASTAPI APP =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ⚠️ Delete old JSON file with passwords if exists
+    old_json = Path("results/results.json")
+    if old_json.exists():
+        try:
+            with open(old_json, 'r') as f:
+                data = json.load(f)
+                if data and "password" in data[0]:
+                    old_json.unlink()
+                    logger.info("🗑️ Deleted old results.json containing passwords")
+        except:
+            pass
+    
     await bot.init()
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT v27.0 - LOOP MODE")
+    logger.info("🎮 ADJARABET BOT v28.0 - LOOP MODE")
     logger.info(f"📍 Host: {CONFIG['host']}:{CONFIG['port']}")
     logger.info(f"⚡ REAL Concurrent tabs: {CONFIG['concurrent_limit']}")
     logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'}")
     logger.info(f"⏱ Loop delay: {CONFIG['loop_delay']}s between cycles")
     logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
-    logger.info("✅ Bot will continuously restart from beginning after each full cycle")
-    logger.info(f"🔐 Main Auth: {AUTH_USERNAME} / {AUTH_PASSWORD[:3]}***")
-    logger.info(f"🔐 Dashboard PIN: {DASHBOARD_PIN}")
-    logger.info(f"🔐 Mobile PIN: {MOBILE_PIN}")
+    logger.info("🔒 ALL API ENDPOINTS PROTECTED WITH BASIC AUTH")
+    logger.info("🔒 PASSWORDS ARE NEVER EXPOSED IN API RESPONSES!")
+    logger.info("🚀 CSS AND RESOURCES BLOCKED FOR MAXIMUM SPEED!")
     logger.info("=" * 50)
     yield
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot Loop Mode", version="27.0", lifespan=lifespan)
+app = FastAPI(title="Adjarabet Bot Loop Mode", version="28.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
+# ================= PUBLIC ROUTES =================
 @app.get("/")
 async def root():
     return HTMLResponse(HTML_UI)
 
+@app.get("/dashboard")
+async def dashboard_page():
+    return HTMLResponse(DASHBOARD_HTML)
+
+@app.get("/mobile")
+async def mobile_page():
+    return HTMLResponse(MOBILE_HTML)
+
+# ================= AUTH ROUTE =================
 @app.post("/token")
 async def get_token(credentials: HTTPBasicCredentials = Depends(verify_auth)):
     token = token_manager.create_token()
     return {"token": token}
 
+# ================= PROTECTED API ROUTES =================
 @app.post("/start")
-async def start_bot(req: Request):
-    global processing_task
+async def start_bot(req: Request, username: str = Depends(verify_api_auth)):
     body = (await req.body()).decode()
     accounts = []
     for line in body.splitlines():
@@ -1110,40 +1333,36 @@ async def start_bot(req: Request):
         processing_task.cancel()
         await asyncio.sleep(0.5)
     
-    processing_task = asyncio.create_task(bot.start(accounts, manager))
+    asyncio.create_task(bot.start(accounts, manager))
     return {"status": "started", "total": len(accounts), "loop_mode": CONFIG["loop_mode"]}
 
 @app.post("/stop")
-async def stop_bot():
+async def stop_bot(username: str = Depends(verify_api_auth)):
     await bot.stop()
     return {"status": "stopped"}
 
 @app.post("/reset")
-async def reset_bot():
+async def reset_bot(username: str = Depends(verify_api_auth)):
     await bot.reset()
     return {"status": "reset"}
 
 @app.post("/clear-results")
-async def clear_results():
+async def clear_results(username: str = Depends(verify_api_auth)):
     await bot.clear_results()
     return {"status": "cleared"}
 
 @app.post("/retry/{username}")
-async def retry_account(username: str):
-    all_data = await bot.get_results()
-    account_data = None
-    for acc in all_data:
-        if acc["username"] == username:
-            account_data = acc
-            break
-    if not account_data:
+async def retry_account(username: str, auth_username: str = Depends(verify_api_auth)):
+    # Get account with password (internal use only)
+    acc = bot.get_account_by_username(username)
+    if not acc:
         return JSONResponse({"error": "Account not found"}, 404)
-    acc = Account(account_data["username"], account_data["password"])
     asyncio.create_task(retry_single_account(acc))
     return {"status": "retry_started", "username": username}
 
 @app.get("/results")
-async def get_results():
+async def get_results(username: str = Depends(verify_api_auth)):
+    """🔒 Returns results WITHOUT passwords!"""
     return await bot.get_results()
 
 @app.get("/health")
@@ -1157,6 +1376,7 @@ async def health():
         "loop_mode": CONFIG["loop_mode"]
     }
 
+# ================= WEBSOCKET =================
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = None):
     if not token or not token_manager.verify_token(token):
@@ -1176,15 +1396,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
-# ================= DASHBOARD & MOBILE ENDPOINTS =================
-@app.get("/dashboard")
-async def dashboard_page():
-    return HTMLResponse(DASHBOARD_HTML)
-
-@app.get("/mobile")
-async def mobile_page():
-    return HTMLResponse(MOBILE_HTML)
-
+# ================= DASHBOARD & MOBILE PIN VERIFICATION =================
 @app.post("/dashboard/verify")
 async def verify_dashboard_pin(request: Request):
     try:
@@ -1210,12 +1422,13 @@ async def verify_mobile_pin(request: Request):
 if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
+    
     print("\n" + "=" * 60)
-    print("🎮 ADJARABET BOT v27.0 - LOOP MODE")
+    print("🎮 ADJARABET BOT v28.0 - LOOP MODE")
     print("=" * 60)
-    print(f"📍 Main UI: http://{CONFIG['host']}:{CONFIG['port']}")
-    print(f"📍 Dashboard: http://{CONFIG['host']}:{CONFIG['port']}/dashboard")
-    print(f"📍 Mobile Monitor: http://{CONFIG['host']}:{CONFIG['port']}/mobile")
+    print(f"📍 Main UI: http://localhost:{CONFIG['port']}")
+    print(f"📍 Dashboard: http://localhost:{CONFIG['port']}/dashboard")
+    print(f"📍 Mobile Monitor: http://localhost:{CONFIG['port']}/mobile")
     print(f"🔐 Main Login: {AUTH_USERNAME} / {AUTH_PASSWORD}")
     print(f"🔐 Dashboard PIN: {DASHBOARD_PIN}")
     print(f"🔐 Mobile PIN: {MOBILE_PIN}")
@@ -1223,5 +1436,9 @@ if __name__ == "__main__":
     print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
     print(f"🔄 LOOP MODE: ON - Bot will restart from beginning after each full cycle!")
     print(f"⏱ Delay between cycles: {CONFIG['loop_delay']} seconds")
+    print("🔒 ALL API ENDPOINTS PROTECTED WITH BASIC AUTH")
+    print("🔒 PASSWORDS ARE NEVER EXPOSED IN API RESPONSES!")
+    print("🚀 CSS AND RESOURCES BLOCKED FOR MAXIMUM SPEED!")
     print("=" * 60 + "\n")
+    
     uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], log_level="warning", access_log=False)
