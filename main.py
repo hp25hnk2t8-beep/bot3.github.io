@@ -25,7 +25,6 @@ load_dotenv()
 # ================= AUTH CONFIG =================
 AUTH_USERNAME = os.getenv("BOT_USERNAME")
 AUTH_PASSWORD = os.getenv("BOT_PASSWORD")
-DASHBOARD_PIN = os.getenv("DASHBOARD_PIN", "0000")
 MOBILE_PIN = os.getenv("MOBILE_PIN", "1111")
 
 if not AUTH_USERNAME or not AUTH_PASSWORD:
@@ -77,8 +76,8 @@ CONFIG = {
     "max_retries": int(os.getenv("MAX_RETRIES", 1)),
     "concurrent_limit": int(os.getenv("CONCURRENT_LIMIT", 4)),
     "delay_between": float(os.getenv("DELAY_BETWEEN", 0.3)),
-    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",  # NEW: անվերջ ցիկլ
-    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),  # NEW: դադար ցիկլերի արանքում
+    "loop_mode": os.getenv("LOOP_MODE", "True").lower() == "true",
+    "loop_delay": float(os.getenv("LOOP_DELAY", 5.0)),
 }
 
 logging.basicConfig(
@@ -165,7 +164,7 @@ class Bot:
         self._running = False
         self._stop_flag = False
         self._processing_task: Optional[asyncio.Task] = None
-        self._loop_task: Optional[asyncio.Task] = None  # NEW: loop task
+        self._loop_task: Optional[asyncio.Task] = None
 
     async def init(self):
         logger.info("Starting browser...")
@@ -306,7 +305,6 @@ class Bot:
             return result
 
     async def _run_one_cycle(self, accounts: List[Account], manager: ConnectionManager) -> bool:
-        """Execute one full cycle of all accounts. Returns True if completed normally."""
         self.all_accounts = accounts.copy()
         self.results = []
         self.current_index = 0
@@ -357,24 +355,20 @@ class Bot:
         return False
 
     async def start(self, accounts: List[Account], manager: ConnectionManager):
-        """Start bot - runs in loop mode if enabled"""
         if self._loop_task and not self._loop_task.done():
             self._loop_task.cancel()
             await asyncio.sleep(0.5)
         
         if CONFIG["loop_mode"]:
-            # NEW: Infinite loop mode
             self._loop_task = asyncio.create_task(self._run_loop(accounts, manager))
             logger.info(f"▶ LOOP MODE STARTED - will run continuously")
             await manager.broadcast("STATUS:loop_mode_started")
         else:
-            # Single run mode (original behavior)
             self._processing_task = asyncio.create_task(self._run_one_cycle(accounts, manager))
             logger.info(f"▶ SINGLE RUN MODE - will stop after one cycle")
             await manager.broadcast("STATUS:started")
 
     async def _run_loop(self, original_accounts: List[Account], manager: ConnectionManager):
-        """Infinite loop: repeatedly process all accounts"""
         cycle_number = 0
         self._running = True
         
@@ -383,10 +377,8 @@ class Bot:
             logger.info(f"🔄 ===== LOOP CYCLE #{cycle_number} STARTING =====")
             await manager.broadcast(f"STATUS:loop_cycle_{cycle_number}")
             
-            # Create fresh copy of accounts for this cycle
             accounts_copy = [Account(acc.username, acc.password) for acc in original_accounts]
             
-            # Run one cycle
             completed = await self._run_one_cycle(accounts_copy, manager)
             
             if not self._running or self._stop_flag:
@@ -398,7 +390,6 @@ class Bot:
                 logger.info(f"✅ Cycle #{cycle_number} completed. Waiting {CONFIG['loop_delay']}s before next cycle...")
                 await manager.broadcast(f"STATUS:waiting_next_cycle:{CONFIG['loop_delay']}")
                 
-                # Wait before next cycle
                 for _ in range(int(CONFIG['loop_delay'])):
                     if self._stop_flag or not self._running:
                         break
@@ -811,93 +802,6 @@ document.getElementById('searchInput').addEventListener('input',()=>renderResult
 </body>
 </html>'''
 
-# ================= DASHBOARD UI =================
-DASHBOARD_HTML = '''<!DOCTYPE html>
-<html lang="hy">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Dashboard | Adjarabet</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        * { margin:0; padding:0; box-sizing:border-box; }
-        body { background: linear-gradient(135deg, #0a0c10 0%, #0d1117 100%); color: #e6edf3; font-family: 'Inter', sans-serif; padding: 12px; min-height: 100vh; }
-        .pin-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.95); backdrop-filter: blur(12px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-        .pin-box { background: #161b22; border: 1px solid #30363d; border-radius: 28px; padding: 30px 25px; width: 300px; text-align: center; }
-        .pin-box h2 { margin-bottom: 20px; background: linear-gradient(135deg, #58a6ff, #3fb950); -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .pin-box input { width: 100%; padding: 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 14px; color: white; font-size: 20px; text-align: center; letter-spacing: 6px; }
-        .pin-box button { width: 100%; padding: 12px; background: linear-gradient(135deg, #238636, #2ea043); border: none; border-radius: 14px; color: white; font-weight: bold; cursor: pointer; margin-top: 16px; }
-        .pin-error { color: #f85149; font-size: 12px; margin-top: 12px; }
-        .dashboard { display: none; }
-        .header { background: rgba(22,27,34,0.95); border-radius: 20px; padding: 14px 18px; margin-bottom: 16px; text-align: center; border: 1px solid #30363d; }
-        .header h1 { font-size: 18px; background: linear-gradient(135deg, #58a6ff, #3fb950); -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .last-update { font-size: 9px; color: #6e7681; margin-top: 4px; }
-        .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 16px; }
-        .stat-card { background: #161b22; border-radius: 16px; padding: 12px; text-align: center; border: 1px solid #30363d; }
-        .stat-number { font-size: 26px; font-weight: 700; color: #58a6ff; }
-        .stat-label { font-size: 10px; color: #8b949e; margin-top: 4px; }
-        .results-card { background: #161b22; border-radius: 20px; border: 1px solid #30363d; overflow: hidden; }
-        .card-header { padding: 10px 14px; background: #0d1117; border-bottom: 1px solid #30363d; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
-        .search-input { padding: 6px 12px; background: #010409; border: 1px solid #30363d; border-radius: 30px; color: white; font-size: 12px; flex: 1; min-width: 100px; }
-        .filter-buttons { display: flex; flex-wrap: wrap; gap: 5px; padding: 8px 12px; background: #0d1117; border-bottom: 1px solid #21262d; }
-        .filter-btn { padding: 4px 10px; background: #21262d; border: none; border-radius: 30px; color: #8b949e; cursor: pointer; font-size: 10px; }
-        .filter-btn.active { background: #58a6ff; color: white; }
-        .refresh-btn { padding: 5px 12px; background: #1f6feb; border: none; border-radius: 30px; color: white; cursor: pointer; font-size: 11px; }
-        .table-container { max-height: 55vh; overflow-y: auto; }
-        table { width: 100%; border-collapse: collapse; }
-        th { background: #0d1117; padding: 8px 6px; text-align: left; font-size: 10px; font-weight: 600; color: #8b949e; cursor: pointer; position: sticky; top: 0; border-bottom: 1px solid #30363d; }
-        td { padding: 8px 6px; font-size: 11px; border-bottom: 1px solid #21262d; word-break: break-word; }
-        .balance-positive { color: #3fb950; font-weight: 600; }
-        .balance-medium { color: #d29922; font-weight: 600; }
-        .balance-zero { color: #f85149; }
-        .copy-btn { background: transparent; border: none; color: #58a6ff; cursor: pointer; font-size: 10px; padding: 2px 5px; border-radius: 4px; margin-left: 4px; }
-        .footer { text-align: center; padding: 12px; font-size: 9px; color: #6e7681; border-top: 1px solid #21262d; margin-top: 12px; }
-        @media (max-width: 480px) { .stat-number { font-size: 20px; } th, td { padding: 6px 4px; font-size: 10px; } }
-    </style>
-</head>
-<body>
-<div id="pinOverlay" class="pin-overlay">
-    <div class="pin-box">
-        <h2><i class="fas fa-lock"></i> Dashboard Access</h2>
-        <input type="password" id="pinInput" placeholder="0000" maxlength="6">
-        <button onclick="verifyPin()">Access</button>
-        <div id="pinError" class="pin-error"></div>
-    </div>
-</div>
-<div id="dashboard" class="dashboard">
-    <div class="header"><h1><i class="fas fa-chart-line"></i> Adjarabet Dashboard</h1><div class="last-update" id="lastUpdate">Loading...</div></div>
-    <div class="stats-grid">
-        <div class="stat-card"><div class="stat-number" id="dashTotal">0</div><div class="stat-label">TOTAL</div></div>
-        <div class="stat-card"><div class="stat-number" style="color:#3fb950" id="dashSuccess">0</div><div class="stat-label">✅ SUCCESS</div></div>
-        <div class="stat-card"><div class="stat-number" style="color:#f85149" id="dashFailed">0</div><div class="stat-label">❌ FAILED</div></div>
-        <div class="stat-card"><div class="stat-number" style="color:#d29922" id="dashTimeout">0</div><div class="stat-label">⏰ TIMEOUT</div></div>
-    </div>
-    <div class="results-card">
-        <div class="card-header"><h3><i class="fas fa-table-list"></i> Results</h3><input type="text" id="dashSearch" class="search-input" placeholder="Search..."><button class="refresh-btn" onclick="manualRefresh()"><i class="fas fa-sync-alt"></i></button></div>
-        <div class="filter-buttons"><button class="filter-btn active" data-filter="all" onclick="setDashFilter('all')">All</button><button class="filter-btn" data-filter="success" onclick="setDashFilter('success')">✅ Success</button><button class="filter-btn" data-filter="failed" onclick="setDashFilter('failed')">❌ Failed</button><button class="filter-btn" data-filter="timeout" onclick="setDashFilter('timeout')">⏰ Timeout</button></div>
-        <div class="table-container"><table id="dashTable"><thead><tr><th onclick="sortDash('status')">Status</th><th onclick="sortDash('username')">Username</th><th onclick="sortDash('balance')">Balance</th></tr></thead><tbody id="dashTableBody"><tr><td colspan="3" style="text-align:center; padding:30px;">Loading...</td></tr></tbody></table></div>
-    </div>
-    <div class="footer"><i class="fas fa-chart-simple"></i> Auto-refresh 5s</div>
-</div>
-<script>
-let dashResults=[], dashFilter='all', dashSort={field:'balance',dir:'desc'}, refreshInterval=null;
-async function verifyPin(){let pin=document.getElementById('pinInput').value;if(!pin){document.getElementById('pinError').innerText='Enter PIN';return;}try{let res=await fetch('/dashboard/verify',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:pin})});let data=await res.json();if(data.success){document.getElementById('pinOverlay').style.display='none';document.getElementById('dashboard').style.display='block';loadResults();startAutoRefresh();}else{document.getElementById('pinError').innerText='Invalid PIN';document.getElementById('pinInput').value='';}}catch(e){document.getElementById('pinError').innerText='Connection error';}}
-async function loadResults(){try{let res=await fetch('/results');if(res.ok){dashResults=await res.json();renderDashTable();updateDashStats();document.getElementById('lastUpdate').innerHTML='Last: '+new Date().toLocaleTimeString();}}catch(e){}}
-function startAutoRefresh(){if(refreshInterval)clearInterval(refreshInterval);refreshInterval=setInterval(loadResults,5000);}
-function manualRefresh(){loadResults();}
-function renderDashTable(){let filtered=dashResults.filter(r=>{if(dashFilter==='success'&&r.status!=='✅')return false;if(dashFilter==='failed'&&r.status!=='❌')return false;if(dashFilter==='timeout'&&r.status!=='⏰')return false;return true;});let search=document.getElementById('dashSearch')?.value.toLowerCase()||'';if(search)filtered=filtered.filter(r=>r.username.toLowerCase().includes(search));filtered.sort((a,b)=>{let av=dashSort.field==='balance'?(a.balance_value||0):(a[dashSort.field]||'').toString().toLowerCase();let bv=dashSort.field==='balance'?(b.balance_value||0):(b[dashSort.field]||'').toString().toLowerCase();if(typeof av==='number')return dashSort.dir==='asc'?av-bv:bv-av;return dashSort.dir==='asc'?(av>bv?1:-1):(av<bv?1:-1);});let balanceClass=(v)=>{let n=parseFloat(v)||0;return n>100?'balance-positive':n>10?'balance-medium':'balance-zero';};document.getElementById('dashTableBody').innerHTML=filtered.map(r=>`<tr><td style="font-size:16px">${r.status}</td><td><strong style="color:#58a6ff">${escapeHtml(r.username)}</strong><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(r.username)}')"><i class="fas fa-copy"></i></button></td><td class="${balanceClass(r.balance_value)}">${r.balance||'0 ֏'}</td></tr>`).join('');if(filtered.length===0&&dashResults.length>0)document.getElementById('dashTableBody').innerHTML='<tr><td colspan="3" style="text-align:center;padding:30px;">No results</td></tr>';}
-function updateDashStats(){document.getElementById('dashTotal').innerText=dashResults.length;document.getElementById('dashSuccess').innerText=dashResults.filter(r=>r.status==='✅').length;document.getElementById('dashFailed').innerText=dashResults.filter(r=>r.status==='❌').length;document.getElementById('dashTimeout').innerText=dashResults.filter(r=>r.status==='⏰').length;}
-function setDashFilter(filter){dashFilter=filter;document.querySelectorAll('.filter-btn').forEach(btn=>btn.classList.toggle('active',btn.dataset.filter===filter));renderDashTable();}
-function sortDash(field){if(dashSort.field===field)dashSort.dir=dashSort.dir==='asc'?'desc':'asc';else{dashSort.field=field;dashSort.dir='desc';}renderDashTable();}
-function copyToClipboard(text){navigator.clipboard.writeText(text).then(()=>{let t=document.createElement('div');t.innerText='Copied!';t.style.position='fixed';t.style.bottom='20px';t.style.left='50%';t.style.transform='translateX(-50%)';t.style.backgroundColor='#238636';t.style.color='white';t.style.padding='4px 12px';t.style.borderRadius='30px';t.style.fontSize='11px';t.style.zIndex='9999';document.body.appendChild(t);setTimeout(()=>t.remove(),1200);});}
-function escapeHtml(s){if(!s)return '';return s.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]);}
-document.getElementById('dashSearch').addEventListener('input',()=>renderDashTable());
-document.getElementById('pinInput').addEventListener('keypress',(e)=>{if(e.key==='Enter')verifyPin();});
-</script>
-</body>
-</html>'''
-
 # ================= MOBILE UI =================
 MOBILE_HTML = '''<!DOCTYPE html>
 <html lang="hy">
@@ -1074,7 +978,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
     logger.info("✅ Bot will continuously restart from beginning after each full cycle")
     logger.info(f"🔐 Main Auth: {AUTH_USERNAME} / {AUTH_PASSWORD[:3]}***")
-    logger.info(f"🔐 Dashboard PIN: {DASHBOARD_PIN}")
     logger.info(f"🔐 Mobile PIN: {MOBILE_PIN}")
     logger.info("=" * 50)
     yield
@@ -1176,25 +1079,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
-# ================= DASHBOARD & MOBILE ENDPOINTS =================
-@app.get("/dashboard")
-async def dashboard_page():
-    return HTMLResponse(DASHBOARD_HTML)
-
+# ================= MOBILE ENDPOINTS =================
 @app.get("/mobile")
 async def mobile_page():
     return HTMLResponse(MOBILE_HTML)
-
-@app.post("/dashboard/verify")
-async def verify_dashboard_pin(request: Request):
-    try:
-        data = await request.json()
-        pin = data.get("pin", "")
-        if pin == DASHBOARD_PIN:
-            return {"success": True}
-        return {"success": False}
-    except:
-        return {"success": False}
 
 @app.post("/mobile/verify")
 async def verify_mobile_pin(request: Request):
@@ -1214,10 +1102,8 @@ if __name__ == "__main__":
     print("🎮 ADJARABET BOT v27.0 - LOOP MODE")
     print("=" * 60)
     print(f"📍 Main UI: http://{CONFIG['host']}:{CONFIG['port']}")
-    print(f"📍 Dashboard: http://{CONFIG['host']}:{CONFIG['port']}/dashboard")
     print(f"📍 Mobile Monitor: http://{CONFIG['host']}:{CONFIG['port']}/mobile")
     print(f"🔐 Main Login: {AUTH_USERNAME} / {AUTH_PASSWORD}")
-    print(f"🔐 Dashboard PIN: {DASHBOARD_PIN}")
     print(f"🔐 Mobile PIN: {MOBILE_PIN}")
     print(f"🔧 Headless: {CONFIG['headless']}")
     print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
