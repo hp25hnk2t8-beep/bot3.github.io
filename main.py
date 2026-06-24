@@ -25,7 +25,6 @@ load_dotenv()
 # ================= AUTH CONFIG =================
 AUTH_USERNAME = os.getenv("BOT_USERNAME")
 AUTH_PASSWORD = os.getenv("BOT_PASSWORD")
-MOBILE_PIN = os.getenv("MOBILE_PIN", "1111")
 
 if not AUTH_USERNAME or not AUTH_PASSWORD:
     raise ValueError("❌ BOT_USERNAME and BOT_PASSWORD must be set in .env file")
@@ -85,7 +84,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%H:%M:%S"
 )
-logger = logging.getLogger("AdjarabetBot")
+logger = logging.getLogger("BalanceBot")
 
 class AccountStatus(Enum):
     SUCCESS = "✅"
@@ -484,7 +483,7 @@ HTML_UI = '''<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Adjarabet Bot | LOOP MODE v27.0</title>
+    <title>Balance Bot | LOOP MODE v27.0</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <style>
@@ -568,6 +567,25 @@ HTML_UI = '''<!DOCTYPE html>
             .filter-bar { flex-direction: column; align-items: stretch; }
             .search-input { width: 100%; }
         }
+        /* Disable text selection and right-click */
+        * {
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
+        textarea {
+            -webkit-user-select: text;
+            -moz-user-select: text;
+            -ms-user-select: text;
+            user-select: text;
+        }
+        input {
+            -webkit-user-select: text;
+            -moz-user-select: text;
+            -ms-user-select: text;
+            user-select: text;
+        }
     </style>
 </head>
 <body>
@@ -584,7 +602,7 @@ HTML_UI = '''<!DOCTYPE html>
 <div id="mainContent" class="main-content">
 <div class="container">
     <div class="header">
-        <h1><i class="fas fa-crown"></i> Adjarabet Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
+        <h1><i class="fas fa-crown"></i> Balance Bot v27.0 | LOOP MODE <span class="loop-badge"><i class="fas fa-sync-alt"></i> INFINITE LOOP</span></h1>
         <div class="header-sub">🔄 Automatically restarts from beginning after each full cycle | Stop → Start resumes from current cycle</div>
         <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
     </div>
@@ -645,6 +663,57 @@ HTML_UI = '''<!DOCTYPE html>
 </div>
 
 <script>
+// ===== DISABLE RIGHT-CLICK AND INSPECT =====
+document.addEventListener('contextmenu', function(e) {
+    e.preventDefault();
+    return false;
+});
+
+document.addEventListener('keydown', function(e) {
+    // F12
+    if (e.key === 'F12' || e.keyCode === 123) {
+        e.preventDefault();
+        return false;
+    }
+    // Ctrl+Shift+I (Inspect)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'i' || e.key === 'I')) {
+        e.preventDefault();
+        return false;
+    }
+    // Ctrl+Shift+J (Console)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'j' || e.key === 'J')) {
+        e.preventDefault();
+        return false;
+    }
+    // Ctrl+U (View Source)
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'u' || e.key === 'U')) {
+        e.preventDefault();
+        return false;
+    }
+    // Ctrl+Shift+C (Inspect Element)
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'c' || e.key === 'C')) {
+        e.preventDefault();
+        return false;
+    }
+    return true;
+});
+
+// Override console.log, warn, error to prevent debug
+if (window.console) {
+    console.log = function() {};
+    console.warn = function() {};
+    console.error = function() {};
+    console.info = function() {};
+    console.debug = function() {};
+}
+
+// Disable drag and drop
+document.addEventListener('dragstart', function(e) {
+    e.preventDefault();
+    return false;
+});
+
+// ===== MAIN APPLICATION CODE =====
 let ws = null, allResults = [], currentFilter = 'all', currentBalanceFilter = 'all', currentSort = { field: 'balance', dir: 'desc' };
 let wsToken = null;
 let highBalanceAlerted = new Set();
@@ -802,175 +871,12 @@ document.getElementById('searchInput').addEventListener('input',()=>renderResult
 </body>
 </html>'''
 
-# ================= MOBILE UI =================
-MOBILE_HTML = '''<!DOCTYPE html>
-<html lang="hy">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=yes">
-    <title>Mobile Monitor | Adjarabet</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: linear-gradient(135deg, #0a0c10 0%, #0d1117 100%); color: #e6edf3; font-family: 'Inter', sans-serif; padding: 10px; min-height: 100vh; }
-        .pin-overlay { position: fixed; top:0; left:0; width:100%; height:100%; background: rgba(0,0,0,0.95); backdrop-filter: blur(12px); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-        .pin-box { background: #161b22; border: 1px solid #30363d; border-radius: 28px; padding: 30px 25px; width: 300px; text-align: center; }
-        .pin-box h2 { margin-bottom: 20px; background: linear-gradient(135deg, #58a6ff, #3fb950); -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .pin-box input { width: 100%; padding: 14px; background: #0d1117; border: 1px solid #30363d; border-radius: 14px; color: white; font-size: 20px; text-align: center; letter-spacing: 6px; }
-        .pin-box button { width: 100%; padding: 12px; background: linear-gradient(135deg, #238636, #2ea043); border: none; border-radius: 14px; color: white; font-weight: bold; cursor: pointer; margin-top: 16px; }
-        .pin-error { color: #f85149; font-size: 12px; margin-top: 12px; }
-        .mobile-dashboard { display: none; }
-        .header { background: rgba(22,27,34,0.95); border-radius: 18px; padding: 10px 14px; margin-bottom: 12px; text-align: center; border: 1px solid #30363d; }
-        .header h1 { font-size: 16px; background: linear-gradient(135deg, #58a6ff, #3fb950); -webkit-background-clip: text; background-clip: text; color: transparent; }
-        .last-update { font-size: 9px; color: #6e7681; margin-top: 3px; }
-        .toolbar { display: flex; justify-content: flex-end; margin-bottom: 12px; }
-        .refresh-all-btn { background: #1f6feb; border: none; border-radius: 30px; color: white; padding: 6px 14px; font-size: 11px; font-weight: 500; cursor: pointer; display: flex; align-items: center; gap: 5px; }
-        .accounts-list { display: flex; flex-direction: column; gap: 10px; }
-        .account-card { background: #161b22; border-radius: 16px; border: 1px solid #30363d; overflow: hidden; }
-        .account-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid #21262d; }
-        .account-row:last-child { border-bottom: none; }
-        .label { font-size: 9px; color: #8b949e; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
-        .username-value { font-size: 14px; font-weight: 600; color: #58a6ff; word-break: break-all; }
-        .password-value { font-size: 12px; font-family: monospace; color: #e6edf3; word-break: break-all; }
-        .balance-value { font-size: 16px; font-weight: 700; }
-        .balance-positive { color: #3fb950; }
-        .balance-medium { color: #d29922; }
-        .balance-zero { color: #f85149; }
-        .copy-btn { background: transparent; border: 1px solid #30363d; border-radius: 20px; padding: 3px 8px; color: #58a6ff; cursor: pointer; font-size: 10px; margin-left: 6px; }
-        .refresh-row-btn { background: #21262d; border: none; border-radius: 30px; padding: 5px 10px; color: #d29922; cursor: pointer; font-size: 10px; display: flex; align-items: center; gap: 3px; }
-        .status-badge { font-size: 16px; margin-right: 6px; }
-        .row-header { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-        .error-text { font-size: 9px; color: #f85149; margin-top: 3px; }
-        .footer { text-align: center; padding: 12px; font-size: 9px; color: #6e7681; border-top: 1px solid #21262d; margin-top: 16px; }
-        @media (max-width: 480px) {
-            body { padding: 8px; }
-            .account-row { padding: 10px; flex-direction: column; align-items: flex-start; gap: 8px; }
-            .row-header { width: 100%; justify-content: space-between; }
-        }
-    </style>
-</head>
-<body>
-<div id="pinOverlay" class="pin-overlay">
-    <div class="pin-box">
-        <h2><i class="fas fa-lock"></i> Mobile Access</h2>
-        <input type="password" id="pinInput" placeholder="0000" maxlength="6">
-        <button onclick="verifyPin()">Access</button>
-        <div id="pinError" class="pin-error"></div>
-    </div>
-</div>
-<div id="mobileDashboard" class="mobile-dashboard">
-    <div class="header">
-        <h1><i class="fas fa-mobile-alt"></i> Mobile Monitor</h1>
-        <div class="last-update" id="lastUpdate">Loading...</div>
-    </div>
-    <div class="toolbar">
-        <button class="refresh-all-btn" onclick="manualRefresh()"><i class="fas fa-sync-alt"></i> Refresh All</button>
-    </div>
-    <div class="accounts-list" id="accountsList">
-        <div style="text-align:center; padding:30px;"><i class="fas fa-spinner fa-pulse"></i> Loading...</div>
-    </div>
-    <div class="footer"><i class="fas fa-chart-line"></i> Auto-refresh 5s | Sorted by balance (highest first)</div>
-</div>
-<script>
-let mobileResults = [], refreshInterval = null;
-
-function sortByBalanceDesc(data) {
-    return [...data].sort((a, b) => {
-        const balanceA = parseFloat(a.balance_value) || 0;
-        const balanceB = parseFloat(b.balance_value) || 0;
-        return balanceB - balanceA;
-    });
-}
-
-async function verifyPin() {
-    const pin = document.getElementById('pinInput').value;
-    const errorDiv = document.getElementById('pinError');
-    if(!pin) { errorDiv.innerText = 'Enter PIN'; return; }
-    try {
-        const res = await fetch('/mobile/verify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pin: pin })
-        });
-        const data = await res.json();
-        if(data.success) {
-            document.getElementById('pinOverlay').style.display = 'none';
-            document.getElementById('mobileDashboard').style.display = 'block';
-            loadResults();
-            startAutoRefresh();
-        } else {
-            errorDiv.innerText = 'Invalid PIN';
-            document.getElementById('pinInput').value = '';
-        }
-    } catch(e) { errorDiv.innerText = 'Connection error'; }
-}
-
-async function loadResults() {
-    try {
-        const res = await fetch('/results');
-        if(res.ok) {
-            const data = await res.json();
-            mobileResults = sortByBalanceDesc(data);
-            renderMobileList();
-            document.getElementById('lastUpdate').innerHTML = 'Last: '+new Date().toLocaleTimeString();
-        }
-    } catch(e) {}
-}
-
-function startAutoRefresh() { if(refreshInterval) clearInterval(refreshInterval); refreshInterval = setInterval(loadResults, 5000); }
-function manualRefresh() { loadResults(); }
-
-async function refreshSingleAccount(username) {
-    const btnId = 'refresh-btn-'+username.replace(/[^a-zA-Z0-9]/g, '_');
-    const btn = document.getElementById(btnId);
-    if(btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-pulse"></i>'; }
-    try {
-        await fetch('/retry/'+encodeURIComponent(username), { method: 'POST' });
-        setTimeout(() => loadResults(), 2000);
-    } catch(e) {}
-    setTimeout(() => { if(btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-sync-alt"></i> Refresh'; } }, 3000);
-}
-
-function copyToClipboard(text, btn) {
-    navigator.clipboard.writeText(text).then(() => {
-        const orig = btn.innerHTML;
-        btn.innerHTML = '<i class="fas fa-check"></i>';
-        setTimeout(() => btn.innerHTML = orig, 1200);
-    });
-}
-
-function renderMobileList() {
-    const container = document.getElementById('accountsList');
-    if(mobileResults.length === 0) {
-        container.innerHTML = '<div style="text-align:center; padding:30px;"><i class="fas fa-inbox"></i> No results</div>';
-        return;
-    }
-    const balanceClass = (v) => { let n = parseFloat(v)||0; return n>100?'balance-positive':n>10?'balance-medium':'balance-zero'; };
-    container.innerHTML = mobileResults.map(acc => {
-        const safeId = acc.username.replace(/[^a-zA-Z0-9]/g, '_');
-        return `<div class="account-card">
-            <div class="account-row"><div class="row-header"><span class="status-badge">${acc.status}</span><span class="username-value"><strong>${escapeHtml(acc.username)}</strong></span><button class="copy-btn" onclick="copyToClipboard('${escapeHtml(acc.username)}', this)"><i class="fas fa-copy"></i></button></div><button class="refresh-row-btn" id="refresh-btn-${safeId}" onclick="refreshSingleAccount('${escapeHtml(acc.username)}')"><i class="fas fa-sync-alt"></i> Refresh</button></div>
-            <div class="account-row"><div style="flex:1"><div class="label"><i class="fas fa-key"></i> Password</div><div class="password-value">${escapeHtml(acc.password)} <button class="copy-btn" onclick="copyToClipboard('${escapeHtml(acc.password)}', this)"><i class="fas fa-copy"></i></button></div></div></div>
-            <div class="account-row"><div style="flex:1"><div class="label"><i class="fas fa-coins"></i> Balance</div><div class="balance-value ${balanceClass(acc.balance_value)}">${acc.balance || '0 ֏'}</div></div></div>
-            ${acc.error ? `<div class="account-row"><div class="error-text"><i class="fas fa-exclamation-triangle"></i> ${escapeHtml(acc.error)}</div></div>` : ''}
-        </div>`;
-    }).join('');
-}
-
-function escapeHtml(s) { if(!s) return ''; return s.replace(/[&<>]/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;'})[m]); }
-
-document.getElementById('pinInput').addEventListener('keypress', (e) => { if(e.key === 'Enter') verifyPin(); });
-</script>
-</body>
-</html>'''
-
 # ================= FASTAPI APP =================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await bot.init()
     logger.info("=" * 50)
-    logger.info("🎮 ADJARABET BOT v27.0 - LOOP MODE")
+    logger.info("🎮 BALANCE BOT v27.0 - LOOP MODE")
     logger.info(f"📍 Host: {CONFIG['host']}:{CONFIG['port']}")
     logger.info(f"⚡ REAL Concurrent tabs: {CONFIG['concurrent_limit']}")
     logger.info(f"🔄 LOOP MODE: {'ON' if CONFIG['loop_mode'] else 'OFF'}")
@@ -978,12 +884,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"🔧 Headless: {CONFIG['headless']} | Timeout: {CONFIG['timeout_nav']}ms")
     logger.info("✅ Bot will continuously restart from beginning after each full cycle")
     logger.info(f"🔐 Main Auth: {AUTH_USERNAME} / {AUTH_PASSWORD[:3]}***")
-    logger.info(f"🔐 Mobile PIN: {MOBILE_PIN}")
     logger.info("=" * 50)
     yield
     await bot.cleanup()
 
-app = FastAPI(title="Adjarabet Bot Loop Mode", version="27.0", lifespan=lifespan)
+app = FastAPI(title="Balance Bot Loop Mode", version="27.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
@@ -1079,32 +984,14 @@ async def websocket_endpoint(websocket: WebSocket, token: str = None):
     except (WebSocketDisconnect, Exception):
         manager.disconnect(websocket)
 
-# ================= MOBILE ENDPOINTS =================
-@app.get("/mobile")
-async def mobile_page():
-    return HTMLResponse(MOBILE_HTML)
-
-@app.post("/mobile/verify")
-async def verify_mobile_pin(request: Request):
-    try:
-        data = await request.json()
-        pin = data.get("pin", "")
-        if pin == MOBILE_PIN:
-            return {"success": True}
-        return {"success": False}
-    except:
-        return {"success": False}
-
 if __name__ == "__main__":
     import uvicorn
     Path("results").mkdir(exist_ok=True)
     print("\n" + "=" * 60)
-    print("🎮 ADJARABET BOT v27.0 - LOOP MODE")
+    print("🎮 BALANCE BOT v27.0 - LOOP MODE")
     print("=" * 60)
     print(f"📍 Main UI: http://{CONFIG['host']}:{CONFIG['port']}")
-    print(f"📍 Mobile Monitor: http://{CONFIG['host']}:{CONFIG['port']}/mobile")
     print(f"🔐 Main Login: {AUTH_USERNAME} / {AUTH_PASSWORD}")
-    print(f"🔐 Mobile PIN: {MOBILE_PIN}")
     print(f"🔧 Headless: {CONFIG['headless']}")
     print(f"⚡ REAL Concurrent: {CONFIG['concurrent_limit']} tabs at the SAME TIME!")
     print(f"🔄 LOOP MODE: ON - Bot will restart from beginning after each full cycle!")
